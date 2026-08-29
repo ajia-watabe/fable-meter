@@ -8,13 +8,14 @@
 # <swiftbar.hideRunInTerminal>true</swiftbar.hideRunInTerminal>
 # <swiftbar.hideLastUpdated>true</swiftbar.hideLastUpdated>
 # <swiftbar.hideDisablePlugin>true</swiftbar.hideDisablePlugin>
-# <swiftbar.hideSwiftBar>false</swiftbar.hideSwiftBar>
+# <swiftbar.hideSwiftBar>true</swiftbar.hideSwiftBar>
 # <swiftbar.runInBash>false</swiftbar.runInBash>
 """SwiftBar display layer. Reads state.json only -- no network, no Keychain."""
 
 import json
 import os
 import sys
+import unicodedata
 from datetime import datetime, timezone
 
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "fable-meter")
@@ -37,6 +38,8 @@ COLOR_WARN = "#e0a800"
 COLOR_CRIT = "#d0021b"
 COLOR_GRAY = "#8e8e93"
 COLOR_ERROR = "#d0021b"
+
+LABEL_WIDTH = 16
 
 
 def read_state(path=STATE_PATH):
@@ -84,10 +87,22 @@ def fmt_duration(seconds):
     hours, rem = divmod(rem, 3600)
     minutes = rem // 60
     if days:
-        return "%dd %dh" % (days, hours)
+        return "%d日%d時間" % (days, hours)
     if hours:
-        return "%dh %dm" % (hours, minutes)
-    return "%dm" % minutes
+        return "%d時間%d分" % (hours, minutes)
+    return "%d分" % minutes
+
+
+def display_width(text):
+    """Rough monospace cell count: CJK/full-width glyphs occupy two cells."""
+    width = 0
+    for ch in text:
+        width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return width
+
+
+def pad_label(text, width=LABEL_WIDTH):
+    return text + " " * max(0, width - display_width(text))
 
 
 def fmt_reset(text, now):
@@ -101,8 +116,8 @@ def fmt_reset(text, now):
     else:
         stamp = local.strftime("%H:%M")
     if delta <= 0:
-        return "resets %s" % stamp
-    return "resets %s (in %s)" % (stamp, fmt_duration(delta))
+        return "リセット %s" % stamp
+    return "リセット %s (あと%s)" % (stamp, fmt_duration(delta))
 
 
 def build_title(state, now):
@@ -131,8 +146,8 @@ def build_title(state, now):
         suffix = ""
         degraded = False
 
-    title = "F%s%s W%s%s S%s%s" % (values[0], suffix, values[1], suffix,
-                                   values[2], suffix)
+    title = "F%s%%%s W%s%%%s S%s%%%s" % (values[0], suffix, values[1], suffix,
+                                         values[2], suffix)
     return title, degraded
 
 
@@ -170,15 +185,15 @@ def render(state, now=None, python_path=None, fetch_path=None, log_path=LOG_PATH
     data = (state or {}).get("data") if isinstance(state, dict) else None
     if isinstance(data, dict):
         rows = (("Fable", data.get("fable")),
-                ("Weekly", data.get("seven_day")),
-                ("Session", data.get("five_hour")))
+                ("週間(全モデル)", data.get("seven_day")),
+                ("セッション(5h)", data.get("five_hour")))
         for label, entry in rows:
             if not isinstance(entry, dict):
-                lines.append("%-8s --" % label)
+                lines.append("%s --" % pad_label(label))
                 continue
             reset = fmt_reset(entry.get("resets_at"), now)
-            lines.append(("%-8s %3s%%   %s" % (
-                label, fmt_percent(entry.get("percent")), reset)).rstrip()
+            lines.append(("%s %3s%%   %s" % (
+                pad_label(label), fmt_percent(entry.get("percent")), reset)).rstrip()
                 + " | font=Menlo size=12")
         lines.append("---")
         plan = data.get("plan") or "-"
@@ -186,26 +201,27 @@ def render(state, now=None, python_path=None, fetch_path=None, log_path=LOG_PATH
         fetched = parse_iso(state.get("fetched_at"))
         if fetched is not None:
             stamp = fetched.astimezone().strftime("%H:%M:%S")
-            lines.append("Plan: %s · Fetched: %s (%s ago)"
+            lines.append("プラン: %s · 取得: %s (%s前)"
                          % (plan, stamp, fmt_duration(age)))
         else:
-            lines.append("Plan: %s · Fetched: never" % plan)
+            lines.append("プラン: %s · 取得: なし" % plan)
     else:
-        lines.append("No data yet | color=%s" % COLOR_GRAY)
+        lines.append("まだデータがありません | color=%s" % COLOR_GRAY)
         lines.append("---")
 
     if not isinstance(state, dict):
-        lines.append("Error: state.json missing or unreadable | color=%s" % COLOR_ERROR)
+        lines.append("エラー: state.json が見つからないか読めません | color=%s"
+                     % COLOR_ERROR)
     elif state.get("error"):
         at = parse_iso(state.get("error_at"))
         stamp = at.astimezone().strftime("%H:%M:%S") if at else "?"
-        lines.append("Error: %s (%s) | color=%s"
+        lines.append("エラー: %s (%s) | color=%s"
                      % (state.get("error"), stamp, COLOR_ERROR))
 
     lines.append("---")
-    lines.append("Refresh now | bash=%s param1=%s param2=--force terminal=false refresh=true"
+    lines.append("今すぐ更新 | bash=%s param1=%s param2=--force terminal=false refresh=true"
                  % (python_path, fetch_path))
-    lines.append("Open log | bash=/usr/bin/open param1=%s terminal=false" % log_path)
+    lines.append("ログを開く | bash=/usr/bin/open param1=%s terminal=false" % log_path)
     return "\n".join(lines)
 
 

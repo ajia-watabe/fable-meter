@@ -11,7 +11,7 @@
 | 表示層 | SwiftBar プラグイン(Python) |
 | トークン期限切れ時 | **自前更新しない**。エラー表示に留める(Claude Code の認証を壊すリスクをゼロにする) |
 | 通知 | なし。メニューバーの色変化のみ |
-| メニューバー表示 | 短縮形 `F12 W9 S6` |
+| メニューバー表示 | 短縮形 `F12% W9% S6%` |
 | 取得間隔 | 5分(launchd)+ ドロップダウンの `Refresh now` |
 | プロジェクト名 | `fable-meter`(キャッシュ `~/.cache/fable-meter/`、launchd ラベル `com.local.fable-meter`) |
 | リポジトリ | git 管理、GitHub **private** |
@@ -153,30 +153,31 @@ claude-usage-tracker/          (GitHub: fable-meter, private)
 
 ## 5. 表示層 `plugin/fable.10s.py`
 
-- SwiftBar メタデータ(`<swiftbar.hideAbout>`, `<swiftbar.runInBash>false` 等)を先頭コメントに。
+- SwiftBar メタデータ(`<swiftbar.hideAbout>`, `<swiftbar.runInBash>false` 等)を先頭コメントに。SwiftBar 自身のサブメニュー行は `<swiftbar.hideSwiftBar>true</swiftbar.hideSwiftBar>` で隠す。
 - state.json を読む。無い/壊れている → `F-- W-- S--` と、ドロップダウンにエラー。
 - 鮮度 = `now - fetched_at`:
 
 | 条件 | タイトル |
 |---|---|
-| 正常(10分未満) | `F12 W9 S6` |
-| 10分以上 30分未満 | `F12? W9? S6?` |
-| 30分以上、または `data == null` | `F-- W-- S--` |
-| `ok == false` かつ鮮度は正常/10分未満 | `F12! W9! S6!`(値は残すが失敗中であることを示す) |
+| 正常(10分未満) | `F12% W9% S6%` |
+| 10分以上 30分未満 | `F12%? W9%? S6%?` |
+| 30分以上、または `data == null` | `F-- W-- S--`(データが無いので `%` は付けない) |
+| `ok == false` かつ鮮度は正常/10分未満 | `F12%! W9%! S6%!`(値は残すが失敗中であることを示す) |
 
 - 色(Fable の % で決める。SwiftBar は背景色を変えられないので文字色で代替): 80% 超 → `color=#e0a800`(黄)、95% 超 → `color=#d0021b`(赤)。それ以外はデフォルト。鮮度異常(`?`/`--`)時はグレー `color=#8e8e93`。
-- ドロップダウン:
+- ドロップダウン(日本語。ラベルは全角幅を2桁として計算し、等幅 `font=Menlo size=12` で桁を揃える):
   ```
-  Fable   12%   resets 9/4 23:59 (in 5d 2h)
-  Weekly   9%   resets 9/4 24:00 (in 5d 3h)
-  Session  6%   resets 01:00 (in 3h 21m)
+  Fable             12%   リセット 9/4 23:59 (あと5日2時間)
+  週間(全モデル)      9%   リセット 9/4 24:00 (あと5日3時間)
+  セッション(5h)      6%   リセット 01:00 (あと3時間21分)
   ---
-  Plan: max · Fetched: 21:05:12 (3m ago)
-  Error: token_expired (21:10:00)     ← エラー時のみ、赤
+  プラン: max · 取得: 21:05:12 (3分前)
+  エラー: token_expired (21:10:00)     ← エラー時のみ、赤
   ---
-  Refresh now      | bash=<abs python3> param1=<abs fetch.py> param2=--force terminal=false refresh=true
-  Open log         | bash=open param1=~/.cache/fable-meter/fetch.log terminal=false
+  今すぐ更新        | bash=<abs python3> param1=<abs fetch.py> param2=--force terminal=false refresh=true
+  ログを開く        | bash=open param1=~/.cache/fable-meter/fetch.log terminal=false
   ```
+- リセット時刻は `astimezone()` でローカル時刻に変換して表示する。
 - 表示層は**ネットワークにも Keychain にもアクセスしない**。
 - 実行間隔はファイル名 `fable.10s.py` で固定。
 
@@ -212,14 +213,14 @@ uninstall.sh: bootout → plist 削除 → プラグイン削除 → キャッ�
 ## 8. テスト(`python3 -m unittest`)
 
 - `test_fetch.py`: fixture から `parse_usage()` が fable/seven_day/five_hour を正しく取り出す。`limits[]` から Fable を抜いた fixture → `fable_not_found`。`limits` 欠落 → `schema_error`。`percent` 非数値 → `schema_error`。state 書き出しがエラー時に前回の `data` を保持する。
-- `test_plugin.py`: 鮮度 0/11/31 分で `F12 W9 S6` / `F12? …` / `F-- …` になる。`ok=false` で `!`。80%/95% 超で色パラメータが付く。state.json 欠落で `--`。
+- `test_plugin.py`: 鮮度 0/11/31 分で `F12% W9% S6%` / `F12%? …` / `F-- …` になる。`ok=false` で `!`。80%/95% 超で色パラメータが付く。state.json 欠落で `--`。日本語ラベル・`リセット` / `今すぐ更新` / `ログを開く` が出る。
 
 ## 9. 動作確認手順(実装後に必ず行う)
 
 1. `python3 fetch.py --dry-run --force` → JSON に `fable.percent` が出て、claude.ai 設定画面の値と一致する。
 2. `python3 -m unittest discover tests` 全件パス。
 3. `./install.sh` → `launchctl print gui/$(id -u)/com.local.fable-meter` で登録確認、`~/.cache/fable-meter/state.json` が生成される。
-4. `python3 plugin/fable.10s.py` を直接実行して 1 行目が `F12 W9 S6` 形式であることを確認。SwiftBar のメニューバーにも出る。
+4. `python3 plugin/fable.10s.py` を直接実行して 1 行目が `F12% W9% S6%` 形式であることを確認。SwiftBar のメニューバーにも出る。
 5. トークン消費確認: 取得を 3 回連続で実行しても `percent` が変わらない(GET のみなので推論は発生しない)。
 6. ログ・state.json・`ps` の引数に `accessToken` 文字列が含まれないことを `grep` で確認。
 

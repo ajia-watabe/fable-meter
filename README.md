@@ -6,10 +6,10 @@ Claude Code の使用量 — 特に **Fable の週次モデル別枠** — を m
 `GET https://api.anthropic.com/api/oauth/usage` の `limits[]` を直接読む。
 
 ```
-F13 W10 S9
- │    │   └ Session  … 5時間枠
- │    └──── Weekly   … 週次(全モデル)
- └───────── Fable    … 週次(Fable スコープ)
+F13% W10% S9%
+ │     │    └ セッション … 5時間枠
+ │     └────── 週間      … 週次(全モデル)
+ └──────────── Fable     … 週次(Fable スコープ)
 ```
 
 ## 構成
@@ -46,7 +46,7 @@ SwiftBar (10秒ごと) →  plugin/fable.10s.py → メニューバー
 ```bash
 launchctl print gui/$(id -u)/com.local.fable-meter | head
 cat ~/.cache/fable-meter/state.json
-python3 plugin/fable.10s.py     # 1行目が "F13 W10 S9" 形式
+python3 plugin/fable.10s.py     # 1行目が "F13% W10% S9%" 形式
 ```
 
 ## アンインストール
@@ -62,10 +62,10 @@ SwiftBar 本体は残る(不要なら `brew uninstall --cask swiftbar`)。
 
 | メニューバー | 意味 |
 |---|---|
-| `F13 W10 S9` | 正常。取得から10分未満 |
-| `F13? W10? S9?` | 取得から 10〜30分。値が古い可能性(グレー表示) |
-| `F-- W-- S--` | 取得から30分以上、またはデータ無し(グレー表示) |
-| `F13! W10! S9!` | 値は新しいが**直近の取得が失敗している**。ドロップダウンに理由 |
+| `F13% W10% S9%` | 正常。取得から10分未満 |
+| `F13%? W10%? S9%?` | 取得から 10〜30分。値が古い可能性(グレー表示) |
+| `F-- W-- S--` | 取得から30分以上、またはデータ無し(グレー表示。`%` は付かない) |
+| `F13%! W10%! S9%!` | 値は新しいが**直近の取得が失敗している**。ドロップダウンに理由 |
 
 色(Fable の % で決まる):
 
@@ -76,8 +76,21 @@ SwiftBar 本体は残る(不要なら `brew uninstall --cask swiftbar`)。
 **取得に失敗しても直前の値は上書きしない。** 代わりに `!` / `?` / `--` で古さと失敗を明示する
 (古い値を「現在値」として誤読させないため)。
 
-ドロップダウンには各枠の % とリセット時刻、プラン、最終取得時刻、エラー、
-`Refresh now`(手動取得)、`Open log` がある。
+ドロップダウンは日本語表示。各枠の % とリセット時刻、プラン、最終取得時刻、エラー、
+`今すぐ更新`(手動取得)、`ログを開く` がある。
+
+```
+Fable             13%   リセット 9/4 23:59 (あと6日2時間)
+週間(全モデル)     10%   リセット 9/4 24:00 (あと6日2時間)
+セッション(5h)      9%   リセット 01:00 (あと3時間8分)
+---
+プラン: max · 取得: 21:50:36 (1分前)
+---
+今すぐ更新
+ログを開く
+```
+
+SwiftBar 自身のサブメニュー行は `<swiftbar.hideSwiftBar>true</swiftbar.hideSwiftBar>` で非表示にしている。
 
 ## トラブルシュート
 
@@ -94,7 +107,7 @@ SwiftBar 本体は残る(不要なら `brew uninstall --cask swiftbar`)。
 
 Keychain の `accessToken` が期限切れ(寿命は数時間)。
 **本ツールはトークンを自前で更新しない**(Claude Code の認証を壊さないための設計判断)。
-Claude Code を起動すれば Claude Code 自身がトークンを更新するので、その後 `Refresh now` すれば直る。
+Claude Code を起動すれば Claude Code 自身がトークンを更新するので、その後 `今すぐ更新` すれば直る。
 
 ### `fable_not_found`
 
@@ -103,7 +116,7 @@ API 側の仕様変更か、Fable 枠が現在割り当てられていない。*
 
 ### `schema_error` / `http_<status>` / `rate_limited` / `network_error` / `auth_error`
 
-`~/.cache/fable-meter/fetch.log` を見る(ドロップダウンの `Open log`)。
+`~/.cache/fable-meter/fetch.log` を見る(ドロップダウンの `ログを開く`)。
 `auth_error` は 401/403。`rate_limited` は 429 — デバッグ中の連打に注意。
 
 ### メニューバーに出ない
