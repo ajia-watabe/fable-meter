@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.log
+state.json
+*.tmp
+.DS_Store
+launchd/com.local.fable-meter.plist
