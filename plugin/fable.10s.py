@@ -13,6 +13,7 @@
 """SwiftBar display layer. Reads state.json only -- no network, no Keychain."""
 
 import json
+import math
 import os
 import sys
 import unicodedata
@@ -36,14 +37,20 @@ def default_fetch_path():
 STALE_SECONDS = 10 * 60
 DEAD_SECONDS = 30 * 60
 
+# 色はメニューバーのタイトル行だけに付ける。
 COLOR_WARN = "#e0a800"
 COLOR_CRIT = "#d0021b"
 COLOR_GRAY = "#8e8e93"
-COLOR_ERROR = "#d0021b"
-# SwiftBar は color=<light>,<dark> の二値指定に対応する。
-# 情報行は明示指定しないと無効行(淡いグレー)として描画されるため必ず付ける。
-COLOR_INFO = "#1d1d1f,#e8e8ed"
-COLOR_SECONDARY = "#6e6e73,#98989d"
+
+# ドロップダウンの情報行には color= を**付けない**。
+# SwiftBar の MenuBarItem.configureAction() は
+#   if params.hasAction || params.color != nil { item.action = ... }
+# となっており(SwiftBar/MenuBar/MenuBarItem.swift)、color= を付けただけの行も
+# クリック可能な項目になってしまう(ホバーで選択ハイライトが出る)。
+# SwiftBar に disabled= 相当のパラメータは無いので、状態表示の行は
+#   「色を付けない = アクションを持たない = 無効項目」
+# として macOS 標準の淡色描画に任せる。ハイライトしないことを優先する。
+ERROR_PREFIX = "\u26a0\ufe0f "
 
 LABEL_WIDTH = 16
 
@@ -224,8 +231,16 @@ def project(points, resets_at, now=None):
     return ("reset", projected)
 
 
+def collecting_hours(points, now):
+    """Hours left until the current window spans enough time to project."""
+    if not points:
+        return int(math.ceil(PROJECTION_MIN_SPAN_SECONDS / 3600.0))
+    remaining = PROJECTION_MIN_SPAN_SECONDS - (now - points[0]["t"]).total_seconds()
+    return max(1, int(math.ceil(remaining / 3600.0)))
+
+
 def projection_row(state, now, history=None):
-    """The 予測 line, or None when the data does not support one."""
+    """The 予測 line, or None when the state itself does not support one."""
     if not isinstance(state, dict) or state.get("ok") is not True:
         return None
     age = age_seconds(state, now)
@@ -239,20 +254,20 @@ def projection_row(state, now, history=None):
         return None
     resets_at_text = fable.get("resets_at")
     resets_at = parse_iso(resets_at_text)
-    if resets_at is None:
+    if resets_at is None or (resets_at - now).total_seconds() <= 0:
         return None
     if history is None:
         history = read_history()
-    result = project(window_points(history, resets_at_text), resets_at, now)
+    points = window_points(history, resets_at_text)
+    result = project(points, resets_at, now)
     if result is None:
-        return None
+        # 状態は新しいのに履歴が足りないだけ: 収集中であることを出す。
+        return "予測: データ収集中(あと約%d時間)" % collecting_hours(points, now)
     kind, value = result
     if kind == "cross":
         local = value.astimezone()
-        text = "予測: 100%%到達 %sごろ" % local.strftime("%-m/%-d %-H時")
-    else:
-        text = "予測: リセット時点 ~%d%%" % int(round(value))
-    return "%s | color=%s" % (text, COLOR_SECONDARY)
+        return "予測: 100%%到達 %sごろ" % local.strftime("%-m/%-d %-H時")
+    return "予測: リセット時点 ~%d%%" % int(round(value))
 
 
 def build_title(state, now):
@@ -325,39 +340,34 @@ def render(state, now=None, python_path=None, fetch_path=None, log_path=LOG_PATH
                 ("セッション(5h)", data.get("five_hour")))
         for label, entry in rows:
             if not isinstance(entry, dict):
-                lines.append("%s -- | font=Menlo size=12 color=%s"
-                             % (pad_label(label), COLOR_INFO))
+                lines.append("%s -- | font=Menlo size=12" % pad_label(label))
                 continue
             reset = fmt_reset(entry.get("resets_at"), now)
             lines.append(("%s %3s%%   %s" % (
                 pad_label(label), fmt_percent(entry.get("percent")), reset)).rstrip()
-                + " | font=Menlo size=12 color=%s" % COLOR_INFO)
+                + " | font=Menlo size=12")
         projection = projection_row(state, now, history)
         if projection:
             lines.append(projection)
         lines.append("---")
-        plan = data.get("plan") or "-"
         age = age_seconds(state, now)
         fetched = parse_iso(state.get("fetched_at"))
         if fetched is not None:
             stamp = fetched.astimezone().strftime("%H:%M:%S")
-            lines.append("プラン: %s · 取得: %s (%s前) | color=%s"
-                         % (plan, stamp, fmt_duration(age), COLOR_SECONDARY))
+            lines.append("取得: %s (%s前)" % (stamp, fmt_duration(age)))
         else:
-            lines.append("プラン: %s · 取得: なし | color=%s"
-                         % (plan, COLOR_SECONDARY))
+            lines.append("取得: なし")
     else:
-        lines.append("まだデータがありません | color=%s" % COLOR_SECONDARY)
+        lines.append("まだデータがありません")
         lines.append("---")
 
     if not isinstance(state, dict):
-        lines.append("エラー: state.json が見つからないか読めません | color=%s"
-                     % COLOR_ERROR)
+        lines.append("%sエラー: state.json が見つからないか読めません" % ERROR_PREFIX)
     elif state.get("error"):
         at = parse_iso(state.get("error_at"))
         stamp = at.astimezone().strftime("%H:%M:%S") if at else "?"
-        lines.append("エラー: %s (%s) | color=%s"
-                     % (state.get("error"), stamp, COLOR_ERROR))
+        lines.append("%sエラー: %s (%s)"
+                     % (ERROR_PREFIX, state.get("error"), stamp))
 
     lines.append("---")
     lines.append("リフレッシュ | bash=%s param1=%s param2=--force terminal=false "

@@ -114,7 +114,8 @@ class RenderTest(unittest.TestCase):
         self.assertIn("Fable", out)
         self.assertIn("週間(全モデル)", out)
         self.assertIn("セッション(5h)", out)
-        self.assertIn("プラン: max", out)
+        self.assertNotIn("プラン", out)
+        self.assertIn("取得: ", out)
         self.assertIn("リセット", out)
         self.assertIn("リフレッシュ | bash=/p/python3 param1=/r/fetch.py "
                       "param2=--force terminal=false refresh=true "
@@ -122,34 +123,45 @@ class RenderTest(unittest.TestCase):
         self.assertIn("ログを開く | bash=/usr/bin/open", out)
         self.assertIn("sfimage=doc.text", out)
 
-    def test_info_rows_have_explicit_colors(self):
-        out = plugin.render(make_state(3), NOW, python_path="/p/python3",
-                            fetch_path="/r/fetch.py")
-        limit_rows = [ln for ln in out.split("\n")
+    def test_info_rows_carry_no_color_param(self):
+        # SwiftBar turns any row with color= into a clickable (highlightable)
+        # menu item -- MenuBarItem.configureAction():
+        #   if params.hasAction || params.color != nil { item.action = ... }
+        # State rows must stay actionless, so they carry no color at all.
+        out = plugin.render(make_state(3, ok=False, error="token_expired"), NOW,
+                            python_path="/p/python3", fetch_path="/r/fetch.py",
+                            history=[point(12, 6), point(0, 12)])
+        clickable = ("リフレッシュ", "使用量ページを開く", "ログを開く")
+        info_rows = [ln for ln in out.split("\n")[2:]
+                     if ln != "---" and not ln.startswith(clickable)]
+        self.assertTrue(info_rows)
+        for row in info_rows:
+            self.assertNotIn("color=", row)
+        limit_rows = [ln for ln in info_rows
                       if ln.startswith(("Fable", "週間(全モデル)", "セッション(5h)"))]
         self.assertEqual(len(limit_rows), 3)
         for row in limit_rows:
             self.assertIn("font=Menlo size=12", row)
-            self.assertIn("color=%s" % plugin.COLOR_INFO, row)
-        plan_row = [ln for ln in out.split("\n") if ln.startswith("プラン: ")]
-        self.assertEqual(len(plan_row), 1)
-        self.assertIn("color=%s" % plugin.COLOR_SECONDARY, plan_row[0])
 
-    def test_dual_mode_color_format(self):
-        self.assertEqual(plugin.COLOR_INFO, "#1d1d1f,#e8e8ed")
-        self.assertEqual(plugin.COLOR_SECONDARY, "#6e6e73,#98989d")
+    def test_no_plan_row(self):
+        out = plugin.render(make_state(3), NOW)
+        fetched_rows = [ln for ln in out.split("\n") if ln.startswith("取得: ")]
+        self.assertEqual(len(fetched_rows), 1)
+        self.assertEqual(fetched_rows[0], "取得: %s (3分前)"
+                         % (NOW - timedelta(minutes=3)).astimezone().strftime(
+                             "%H:%M:%S"))
 
-    def test_no_data_row_uses_secondary_color(self):
+    def test_no_data_row_is_plain(self):
         state = make_state(0)
         state["data"] = None
         out = plugin.render(state, NOW)
-        self.assertIn("まだデータがありません | color=%s" % plugin.COLOR_SECONDARY,
-                      out)
+        self.assertIn("\nまだデータがありません\n", out)
 
-    def test_error_row_rendered_in_red(self):
+    def test_error_row_is_marked_but_not_colored(self):
         out = plugin.render(make_state(3, ok=False, error="token_expired"), NOW)
-        self.assertIn("エラー: token_expired", out)
-        self.assertIn(plugin.COLOR_ERROR, out)
+        row = [ln for ln in out.split("\n") if "エラー: token_expired" in ln][0]
+        self.assertTrue(row.startswith(plugin.ERROR_PREFIX))
+        self.assertNotIn("color=", row)
 
     def test_missing_state_renders_error_row(self):
         out = plugin.render(None, NOW)
@@ -285,20 +297,41 @@ class ProjectionRowTest(unittest.TestCase):
 
     def test_row_rendered_for_fresh_ok_state(self):
         row = plugin.projection_row(make_state(0), NOW, self.history())
-        self.assertTrue(row.startswith("予測: リセット時点 ~81%"))
-        self.assertIn("color=%s" % plugin.COLOR_SECONDARY, row)
+        self.assertEqual(row, "予測: リセット時点 ~81%")
+        self.assertNotIn("color=", row)
 
     def test_crossing_row_text(self):
         history = [point(10, 10), point(0, 50)]
         row = plugin.projection_row(make_state(0, fable=50), NOW, history)
         expected = (NOW + timedelta(hours=12.5)).astimezone().strftime(
             "%-m/%-d %-H時")
-        self.assertEqual(row.split(" | ")[0], "予測: 100%%到達 %sごろ" % expected)
+        self.assertEqual(row, "予測: 100%%到達 %sごろ" % expected)
 
-    def test_no_row_without_enough_history(self):
-        self.assertIsNone(plugin.projection_row(make_state(0), NOW, []))
-        self.assertIsNone(plugin.projection_row(make_state(0), NOW,
-                                                [point(0, 12)]))
+    def test_collecting_row_without_any_history(self):
+        self.assertEqual(plugin.projection_row(make_state(0), NOW, []),
+                         "予測: データ収集中(あと約3時間)")
+
+    def test_collecting_row_counts_down_from_the_oldest_point(self):
+        # One point 70 minutes old -> 1h50m short of the 3h span -> 2h.
+        row = plugin.projection_row(make_state(0), NOW,
+                                    [point(70 / 60.0, 10), point(0, 12)])
+        self.assertEqual(row, "予測: データ収集中(あと約2時間)")
+
+    def test_collecting_row_never_drops_below_one_hour(self):
+        # A single 5h-old point cannot span anything yet, but the next fetch can.
+        self.assertEqual(plugin.projection_row(make_state(0), NOW,
+                                               [point(5, 10)]),
+                         "予測: データ収集中(あと約1時間)")
+
+    def test_collecting_row_ignores_points_of_the_previous_window(self):
+        old = point(30, 90, resets_at="2026-08-28T14:59:59+00:00")
+        row = plugin.projection_row(make_state(0), NOW, [old, point(1, 12)])
+        self.assertEqual(row, "予測: データ収集中(あと約2時間)")
+
+    def test_collecting_hours_helper(self):
+        self.assertEqual(plugin.collecting_hours([], NOW), 3)
+        self.assertEqual(plugin.collecting_hours([point(0, 1)], NOW), 3)
+        self.assertEqual(plugin.collecting_hours([point(2.5, 1)], NOW), 1)
 
     def test_no_row_when_stale(self):
         self.assertIsNone(plugin.projection_row(make_state(11), NOW,
@@ -321,6 +354,12 @@ class ProjectionRowTest(unittest.TestCase):
         state["data"]["fable"]["resets_at"] = None
         self.assertIsNone(plugin.projection_row(state, NOW, self.history()))
 
+    def test_no_row_once_the_reset_has_passed(self):
+        state = make_state(0)
+        state["data"]["fable"]["resets_at"] = (
+            NOW - timedelta(hours=1)).isoformat()
+        self.assertIsNone(plugin.projection_row(state, NOW, self.history()))
+
     def test_render_places_the_row_after_the_three_limit_rows(self):
         out = plugin.render(make_state(0), NOW, python_path="/p/python3",
                             fetch_path="/r/fetch.py", history=self.history())
@@ -329,8 +368,13 @@ class ProjectionRowTest(unittest.TestCase):
         self.assertTrue(lines[5].startswith("予測: "))
         self.assertEqual(lines[6], "---")
 
-    def test_render_omits_the_row_without_history(self):
+    def test_render_shows_the_collecting_row_without_history(self):
         out = plugin.render(make_state(0), NOW, python_path="/p/python3",
+                            fetch_path="/r/fetch.py", history=[])
+        self.assertIn("\n予測: データ収集中(あと約3時間)\n", out)
+
+    def test_render_omits_the_row_for_a_stale_state(self):
+        out = plugin.render(make_state(11), NOW, python_path="/p/python3",
                             fetch_path="/r/fetch.py", history=[])
         self.assertNotIn("予測:", out)
 

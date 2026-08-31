@@ -186,6 +186,13 @@ claude-usage-tracker/          (GitHub: fable-meter)
 
 ## 5. 表示層 `plugin/fable.10s.py`
 
+- ドロップダウンの状態表示行(3枠・予測・取得・エラー・データ無し)には **`color=` を付けない**。
+  SwiftBar の `MenuBarItem.configureAction()` は
+  `if params.hasAction || params.color != nil { item.target = self; item.action = ... }` なので、
+  `color=` を付けただけの行もクリック可能な項目になり、ホバーで選択ハイライトが出る
+  (SwiftBar に `disabled=` 相当のパラメータは無い)。状態は状態として扱うため、
+  色より「選択できないこと」を優先し、macOS 標準の無効項目描画(淡色)に任せる。
+  エラー行の赤の代わりに、先頭に ⚠️ を付けて目立たせる。
 - SwiftBar メタデータ(`<swiftbar.hideAbout>`, `<swiftbar.runInBash>false` 等)を先頭コメントに。SwiftBar 自身のサブメニュー行は `<swiftbar.hideSwiftBar>true</swiftbar.hideSwiftBar>` で隠す。
 - state.json を読む。無い/壊れている → `F-- W-- S--` と、ドロップダウンにエラー。
 - 鮮度 = `now - fetched_at`:
@@ -203,10 +210,10 @@ claude-usage-tracker/          (GitHub: fable-meter)
   Fable             12%   リセット 9/4 23:59 (あと5日2時間)
   週間(全モデル)      9%   リセット 9/4 24:00 (あと5日3時間)
   セッション(5h)      6%   リセット 01:00 (あと3時間21分)
-  予測: リセット時点 ~34%              ← データが足りなければ行ごと出さない
+  予測: リセット時点 ~34%              ← 履歴が足りなければ「データ収集中(あと約2時間)」
   ---
-  プラン: max · 取得: 21:05:12 (3分前)
-  エラー: token_expired (21:10:00)     ← エラー時のみ、赤
+  取得: 21:05:12 (3分前)
+  ⚠️ エラー: token_expired (21:10:00)  ← エラー時のみ
   ---
   リフレッシュ      | bash=<abs python3> param1=<abs fetch.py> param2=--force terminal=false refresh=true sfimage=arrow.clockwise
   使用量ページを開く | href=https://claude.ai/settings/usage sfimage=safari
@@ -227,7 +234,11 @@ claude-usage-tracker/          (GitHub: fable-meter)
    `projected > 100`(かつ最新 % が 100 未満)→ 100% に到達する時刻を逆算して
    `予測: 100%到達 9/3 15時ごろ`。最新 % が既に 100 以上なら到達時刻は出さず値だけ出す。
 5. `ok != true`、または鮮度 10 分以上のときは**出さない**(古い/失敗中の状態に基づく予測はしない)。
-6. 色は `COLOR_SECONDARY`。
+   `resets_at` が不明/過去のときも出さない。
+6. 状態が新しく `ok` なのに 2 の理由で外挿できないときは、行を消さずに
+   `予測: データ収集中(あと約N時間)` を出す。`N = ceil((3時間 - (now - 今の枠の最古の点)) / 1時間)`
+   で下限 1、点が1つも無ければ 3。「何も出ない」と「まだ足りない」を区別するため。
+7. 色は付けない(下記の理由)。
 - リセット時刻は `astimezone()` でローカル時刻に変換して表示する。
 - 表示層は**ネットワークにも Keychain にもアクセスしない**。
 - 実行間隔はファイル名 `fable.10s.py` で固定。
