@@ -480,5 +480,274 @@ class UsagePageActionTest(unittest.TestCase):
         self.assertTrue(lines[idx + 2].startswith("ログを開く"))
 
 
+# ---------------------------------------------------------------- 適応予測
+
+def aligned(dt):
+    """dt をローカルの時刻境界に丸める(バケットはローカル時刻なのでテストも合わせる)。"""
+    local = dt.astimezone()
+    return local.replace(minute=0, second=0, microsecond=0)
+
+
+def at(when, percent, resets_at=RESETS_AT):
+    return {"t": when, "fable": float(percent), "fable_resets_at": resets_at}
+
+
+def flat_curve():
+    return [1.0 / 24] * 24
+
+
+def half_day_curve(start_hour):
+    """start_hour から 12 時間だけ活動するカーブ(残り 12 時間は share 0)。"""
+    shares = [0.0] * 24
+    for i in range(12):
+        shares[(start_hour + i) % 24] = 1.0 / 12
+    return shares
+
+
+class WeightedSlopeTest(unittest.TestCase):
+    def test_recent_pace_dominates_on_an_accelerating_series(self):
+        # 24h で 20% だが、後半 6h だけで 10% 伸びている。
+        points = [point(24, 0), point(18, 1), point(12, 2),
+                  point(6, 10), point(0, 20)]
+        endpoint = 20.0 / 24
+        slope = plugin.pace_slope(points)
+        self.assertGreater(slope, endpoint)
+        self.assertLess(slope, 2.0)
+
+    def test_late_usage_beats_early_usage_with_the_same_endpoints(self):
+        # 同じ 24h・同じ 0% -> 20% でも、消費が直近に寄っている方が速いと見なす。
+        early = [point(24, 0), point(18, 18), point(12, 19),
+                 point(6, 19), point(0, 20)]
+        late = [point(24, 0), point(18, 1), point(12, 1),
+                point(6, 2), point(0, 20)]
+        self.assertGreater(plugin.pace_slope(late), plugin.pace_slope(early))
+        # 端点だけを見る従来の傾きは両者を区別できない。
+        self.assertAlmostEqual((20.0 - 0.0) / 24, 20.0 / 24, places=9)
+
+    def test_two_points_reproduce_the_endpoint_slope(self):
+        # 2 点なら重み付き最小二乗も 2 点をちょうど通る = 従来と同じ傾き。
+        self.assertAlmostEqual(plugin.pace_slope([point(12, 6), point(0, 12)]),
+                               0.5, places=9)
+
+    def test_slope_is_floored_at_zero(self):
+        self.assertEqual(plugin.pace_slope([point(12, 40), point(0, 30)]), 0.0)
+
+    def test_equal_timestamps_do_not_crash(self):
+        self.assertEqual(plugin.weighted_slope([1.0, 1.0], [2.0, 3.0],
+                                               [0.0, 0.0]), 0.0)
+        self.assertEqual(plugin.pace_slope([point(0, 5), point(0, 9)]), 0.0)
+
+    def test_half_life_shortens_the_memory(self):
+        points = [point(24, 0), point(18, 1), point(12, 2),
+                  point(6, 10), point(0, 20)]
+        xs = [(points[-1]["t"] - p["t"]).total_seconds() / -3600.0
+              for p in points]
+        ys = [p["fable"] for p in points]
+        ages = [(points[-1]["t"] - p["t"]).total_seconds() / 3600.0
+                for p in points]
+        short = plugin.weighted_slope(xs, ys, ages, half_life=3.0)
+        long_ = plugin.weighted_slope(xs, ys, ages, half_life=48.0)
+        self.assertGreater(short, long_)
+        # 重みが 1 点に潰れても例外にはせず 0 を返す。
+        self.assertEqual(plugin.weighted_slope(xs, ys, ages, half_life=1e-9),
+                         0.0)
+
+
+class ActivityCurveTest(unittest.TestCase):
+    def setUp(self):
+        self.base = aligned(NOW) - timedelta(days=2)
+        self.hour = self.base.hour
+
+    def two_day_history(self, extra=()):
+        # 90 分の消費(30 分 + 60 分)を時刻境界をまたいで記録する。
+        entries = [at(self.base + timedelta(minutes=30), 0),
+                   at(self.base + timedelta(hours=2), 3)]
+        entries.extend(extra)
+        # 24 時間以上の観測にするための末尾(消費なし)。
+        entries.append(at(self.base + timedelta(hours=30), 3))
+        return entries
+
+    def test_delta_is_split_across_hour_boundaries_and_normalized(self):
+        shares = plugin.activity_curve(self.two_day_history())
+        self.assertIsNotNone(shares)
+        self.assertAlmostEqual(sum(shares), 1.0, places=9)
+        self.assertAlmostEqual(shares[self.hour], 1.0 / 3, places=9)
+        self.assertAlmostEqual(shares[(self.hour + 1) % 24], 2.0 / 3, places=9)
+        others = [s for h, s in enumerate(shares)
+                  if h not in (self.hour, (self.hour + 1) % 24)]
+        self.assertEqual(set(others), {0.0})
+
+    def test_short_history_has_no_curve(self):
+        entries = [at(self.base, 0), at(self.base + timedelta(hours=23), 5)]
+        self.assertIsNone(plugin.activity_curve(entries))
+
+    def test_flat_history_has_no_curve(self):
+        entries = [at(self.base, 5), at(self.base + timedelta(hours=30), 5)]
+        self.assertIsNone(plugin.activity_curve(entries))
+
+    def test_pairs_that_cross_a_window_are_ignored(self):
+        other = "2026-08-28T15:00:00+00:00"
+        entries = [at(self.base, 90, resets_at=other),
+                   at(self.base + timedelta(hours=1), 2),
+                   at(self.base + timedelta(hours=30), 2)]
+        # 窓またぎの差分(-88)も % 低下も拾わないので、消費は 0 = カーブ無し。
+        self.assertIsNone(plugin.activity_curve(entries))
+
+    def test_second_day_adds_to_the_same_buckets(self):
+        extra = [at(self.base + timedelta(hours=24, minutes=30), 3),
+                 at(self.base + timedelta(hours=25), 6)]
+        shares = plugin.activity_curve(self.two_day_history(extra=extra))
+        # 1日目: h に 1、h+1 に 2。2日目: h に 3。合計 6 → h=4/6, h+1=2/6。
+        self.assertAlmostEqual(shares[self.hour], 4.0 / 6, places=9)
+        self.assertAlmostEqual(shares[(self.hour + 1) % 24], 2.0 / 6, places=9)
+
+    def test_too_few_entries(self):
+        self.assertIsNone(plugin.activity_curve([]))
+        self.assertIsNone(plugin.activity_curve([at(self.base, 1)]))
+
+
+class EffectiveHoursTest(unittest.TestCase):
+    def setUp(self):
+        self.start = aligned(NOW)
+
+    def test_no_curve_is_wallclock(self):
+        self.assertAlmostEqual(
+            plugin.effective_hours(None, self.start,
+                                   self.start + timedelta(hours=7.5)),
+            7.5, places=9)
+
+    def test_flat_curve_equals_wallclock(self):
+        self.assertAlmostEqual(
+            plugin.effective_hours(flat_curve(), self.start,
+                                   self.start + timedelta(hours=7.5)),
+            7.5, places=9)
+
+    def test_active_hours_stretch_and_dead_hours_vanish(self):
+        curve = half_day_curve(self.start.hour)
+        # 活動 12 時間に集中 = 活動中は 2 倍速。
+        self.assertAlmostEqual(
+            plugin.effective_hours(curve, self.start,
+                                   self.start + timedelta(hours=4)),
+            8.0, places=9)
+        night = self.start + timedelta(hours=12)
+        self.assertAlmostEqual(
+            plugin.effective_hours(curve, night, night + timedelta(hours=4)),
+            0.0, places=9)
+
+    def test_a_full_day_is_always_24_effective_hours(self):
+        curve = half_day_curve((self.start.hour + 3) % 24)
+        self.assertAlmostEqual(
+            plugin.effective_hours(curve, self.start,
+                                   self.start + timedelta(hours=24)),
+            24.0, places=6)
+
+    def test_empty_or_reversed_span(self):
+        self.assertEqual(plugin.effective_hours(flat_curve(), self.start,
+                                                self.start), 0.0)
+        self.assertEqual(plugin.effective_hours(flat_curve(), self.start,
+                                                self.start - timedelta(hours=1)),
+                         0.0)
+
+
+class CurveProjectionTest(unittest.TestCase):
+    def setUp(self):
+        self.now = aligned(NOW)
+        # 直近 6 時間と、その後 6 時間だけが活動時間。
+        self.curve = half_day_curve((self.now.hour - 6) % 24)
+        self.points = [at(self.now - timedelta(hours=6), 20),
+                       at(self.now, 50)]
+
+    def test_curve_shrinks_a_night_heavy_remainder(self):
+        resets_at = self.now + timedelta(hours=8)
+        # A のみ: 5%/h * 8h = +40 -> 90%
+        kind, plain = plugin.project(self.points, resets_at, self.now)
+        self.assertEqual((kind, round(plain)), ("reset", 90))
+        # A+B: 実効傾き 2.5%/実効h、残り実効 12h -> +30 -> 80%
+        kind, curved = plugin.project(self.points, resets_at, self.now,
+                                      shares=self.curve)
+        self.assertEqual((kind, round(curved)), ("reset", 80))
+        self.assertLess(curved, plain)
+
+    def test_a_flat_curve_matches_the_wallclock_projection(self):
+        resets_at = self.now + timedelta(hours=8)
+        _, plain = plugin.project(self.points, resets_at, self.now)
+        _, curved = plugin.project(self.points, resets_at, self.now,
+                                   shares=flat_curve())
+        self.assertAlmostEqual(plain, curved, places=6)
+
+    def test_dead_remainder_projects_no_growth(self):
+        night = self.now + timedelta(hours=6)
+        points = [at(night - timedelta(hours=6), 20), at(night, 50)]
+        # 6h 先から 12h は完全な非活動時間: 増えないのが正しい。
+        kind, value = plugin.project(points, night + timedelta(hours=10),
+                                     night, shares=self.curve)
+        self.assertEqual((kind, value), ("reset", 50.0))
+
+    def test_crossing_walks_forward_through_the_curve(self):
+        # 実効 2.5%/h、残り 50% -> 実効 20h。活動 6h(=12) + 死んだ 12h(=0)
+        # + 活動 4h(=8) で到達 = 22 時間後。
+        kind, when = plugin.project(self.points, self.now + timedelta(hours=48),
+                                    self.now, shares=self.curve)
+        self.assertEqual(kind, "cross")
+        self.assertEqual(when, self.now + timedelta(hours=22))
+
+    def test_crossing_without_a_curve_is_linear(self):
+        kind, when = plugin.project(self.points, self.now + timedelta(hours=48),
+                                    self.now)
+        self.assertEqual(kind, "cross")
+        self.assertEqual(when, self.now + timedelta(hours=10))
+
+    def test_unreachable_crossing_falls_back_to_the_value(self):
+        # 到達までに歩ける時間の上限を超えるケースでは値だけを返す。
+        curve = [0.0] * 24
+        curve[(self.now.hour + 1) % 24] = 1.0
+        points = [at(self.now - timedelta(hours=6), 49),
+                  at(self.now, 50)]
+        result = plugin.project(points, self.now + timedelta(hours=8),
+                                self.now, shares=curve)
+        self.assertEqual(result[0], "reset")
+
+    def test_advance_effective_returns_none_when_never_reached(self):
+        self.assertIsNone(plugin.advance_effective([0.0] * 24, self.now, 1.0))
+        self.assertEqual(plugin.advance_effective(None, self.now, 0.0), self.now)
+
+
+class ProjectionGateTest(unittest.TestCase):
+    def setUp(self):
+        self.now = aligned(NOW) + timedelta(minutes=5)
+        self.resets = "2026-09-04T14:59:59+00:00"
+
+    def state(self, fable):
+        state = make_state(0, fable=fable)
+        state["fetched_at"] = self.now.isoformat()
+        return state
+
+    def history(self, hours):
+        start = self.now - timedelta(hours=hours)
+        return [at(start + timedelta(hours=h), h * 0.1, resets_at=self.resets)
+                for h in range(int(hours) + 1)]
+
+    def test_short_history_falls_back_to_component_a(self):
+        history = self.history(6)
+        self.assertIsNone(plugin.activity_curve(history))
+        row = plugin.projection_row(self.state(6), self.now, history)
+        kind, value = plugin.project(history, plugin.parse_iso(self.resets),
+                                     self.now)
+        self.assertEqual(kind, "reset")
+        self.assertEqual(row, "予測: リセット時点 ~%d%%" % round(value))
+
+    def test_long_history_activates_the_curve(self):
+        history = self.history(30)
+        self.assertIsNotNone(plugin.activity_curve(history))
+        row = plugin.projection_row(self.state(30), self.now, history)
+        self.assertTrue(row.startswith("予測: "))
+        self.assertNotIn("収集中", row)
+
+    def test_two_hours_of_history_is_still_collecting(self):
+        history = self.history(2)
+        row = plugin.projection_row(self.state(2), self.now, history)
+        self.assertTrue(row.startswith("予測: データ収集中("))
+
+
 if __name__ == "__main__":
     unittest.main()

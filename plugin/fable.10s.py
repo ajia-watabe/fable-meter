@@ -106,6 +106,17 @@ PROJECTION_MIN_SPAN_SECONDS = 3 * 3600
 PROJECTION_MAX_PERCENT = 200
 HISTORY_MAX_LINES = 4000
 
+# 成分A(直近重み付き傾き): 重み w_i = 0.5 ** (経過時間h / 半減期)。
+# 12 時間で重み半分 = 「今日の後半」が「昨日」の倍効く。
+SLOPE_HALF_LIFE_HOURS = 12.0
+
+# 成分B(1日の活動カーブ): 24 個の時刻バケット。
+CURVE_BUCKETS = 24
+# カーブを使うには履歴全体で 24 時間以上の観測が要る。
+CURVE_MIN_SPAN_SECONDS = 24 * 3600
+# 時刻境界を歩くループの安全上限(履歴8日・窓7日のどちらも 200 時間未満)。
+CURVE_MAX_STEPS = 24 * 40
+
 
 def read_state(path=STATE_PATH):
     try:
@@ -258,8 +269,148 @@ def window_points(entries, resets_at):
     return points
 
 
-def project(points, resets_at, now=None):
-    """Linear pace projection for the current window.
+def hour_segments(start, end):
+    """Split [start, end) at local hour boundaries.
+
+    Yields (local hour-of-day, length in hours). The activity curve is a human
+    daily rhythm, so the bucket is the *local* hour, not UTC.
+    """
+    if start is None or end is None or end <= start:
+        return
+    cursor = start
+    steps = 0
+    while cursor < end and steps < CURVE_MAX_STEPS:
+        local = cursor.astimezone()
+        boundary = local.replace(minute=0, second=0, microsecond=0) \
+            + timedelta(hours=1)
+        stop = end if end < boundary else boundary
+        yield local.hour, (stop - cursor).total_seconds() / 3600.0
+        cursor = stop
+        steps += 1
+
+
+def activity_curve(entries):
+    """24-bucket hour-of-day activity profile, or None when it cannot be built.
+
+    Every pair of consecutive samples inside one window contributes its delta%
+    to the hour buckets the pair spans, split proportionally by time. The sums
+    are normalized to shares (total 1). Buckets with no observed usage keep a
+    share of 0 -- a dead night is information, not missing data.
+
+    Gates: at least CURVE_MIN_SPAN_SECONDS of history overall and a positive
+    total delta. Otherwise None (component B is inactive).
+    """
+    entries = [e for e in (entries or []) if e.get("t") is not None]
+    if len(entries) < 2:
+        return None
+    if (entries[-1]["t"] - entries[0]["t"]).total_seconds() \
+            < CURVE_MIN_SPAN_SECONDS:
+        return None
+    totals = [0.0] * CURVE_BUCKETS
+    for prev, nxt in zip(entries, entries[1:]):
+        if reset_key(prev.get("fable_resets_at")) \
+                != reset_key(nxt.get("fable_resets_at")):
+            continue  # 窓をまたぐ差分は消費ではない。
+        delta = nxt["fable"] - prev["fable"]
+        if delta <= 0:
+            continue
+        span = (nxt["t"] - prev["t"]).total_seconds() / 3600.0
+        if span <= 0:
+            continue
+        for hour, length in hour_segments(prev["t"], nxt["t"]):
+            totals[hour] += delta * (length / span)
+    grand = sum(totals)
+    if grand <= 0:
+        return None
+    return [value / grand for value in totals]
+
+
+def effective_hours(shares, start, end):
+    """Wallclock [start, end) re-scaled by how active those hours usually are.
+
+    Sum the shares of the hours covered (prorated), then divide by the mean
+    share 1/24. A flat curve gives back the wallclock hours; a curve that is
+    dead at night shrinks a night-heavy span towards 0.
+    """
+    if start is None or end is None or end <= start:
+        return 0.0
+    if not shares:
+        return (end - start).total_seconds() / 3600.0
+    total = 0.0
+    for hour, length in hour_segments(start, end):
+        total += shares[hour] * length
+    return total * CURVE_BUCKETS
+
+
+def advance_effective(shares, start, hours):
+    """Wallclock time at which `hours` effective hours have elapsed from start.
+
+    Returns None when the target is not reached within CURVE_MAX_STEPS hours
+    (e.g. a curve whose remaining hours are all dead).
+    """
+    if hours <= 0:
+        return start
+    if not shares:
+        return start + timedelta(hours=hours)
+    cursor = start
+    remaining = hours
+    for _ in range(CURVE_MAX_STEPS):
+        local = cursor.astimezone()
+        boundary = local.replace(minute=0, second=0, microsecond=0) \
+            + timedelta(hours=1)
+        length = (boundary - cursor).total_seconds() / 3600.0
+        gain = shares[local.hour] * length * CURVE_BUCKETS
+        if gain >= remaining > 0:
+            rate = shares[local.hour] * CURVE_BUCKETS
+            return cursor + timedelta(hours=remaining / rate)
+        remaining -= gain
+        cursor = boundary
+    return None
+
+
+def weighted_slope(xs, ys, ages_hours, half_life=SLOPE_HALF_LIFE_HOURS):
+    """Weighted least squares slope of y over x, weight 0.5 ** (age / half_life).
+
+    Recent samples dominate, so "current pace" follows recent behaviour instead
+    of being dragged by the first point of the window. Degenerate input (all x
+    equal, zero weights) yields 0.0 rather than an exception.
+    """
+    sw = sx = sy = sxx = sxy = 0.0
+    for x, y, age in zip(xs, ys, ages_hours):
+        w = 0.5 ** (max(0.0, age) / half_life) if half_life > 0 else 1.0
+        sw += w
+        sx += w * x
+        sy += w * y
+        sxx += w * x * x
+        sxy += w * x * y
+    denom = sw * sxx - sx * sx
+    if sw <= 0 or denom <= 1e-12:
+        return 0.0
+    return (sw * sxy - sx * sy) / denom
+
+
+def pace_slope(points, shares=None):
+    """Component A: %/hour of *effective* time (wallclock when shares is None).
+
+    Timestamps are mapped to effective hours elapsed with the same curve used
+    for the remaining time, so slope and remaining time share one unit.
+    """
+    if len(points) < 2:
+        return 0.0
+    base = points[0]["t"]
+    last = points[-1]["t"]
+    xs = [effective_hours(shares, base, p["t"]) for p in points]
+    ys = [p["fable"] for p in points]
+    ages = [(last - p["t"]).total_seconds() / 3600.0 for p in points]
+    return max(0.0, weighted_slope(xs, ys, ages))
+
+
+def project(points, resets_at, now=None, shares=None):
+    """Pace projection for the current window.
+
+    Component A (recency-weighted slope) always; component B (daily activity
+    curve) when `shares` is given -- then both the fit and the remaining time
+    are measured in effective hours instead of wallclock hours.
 
     Returns None (not enough data), ("reset", percent) for the value expected at
     the reset, or ("cross", datetime) for when 100% is expected to be reached.
@@ -270,16 +421,18 @@ def project(points, resets_at, now=None):
     span = (last["t"] - first["t"]).total_seconds()
     if span < PROJECTION_MIN_SPAN_SECONDS:
         return None
-    remaining = (resets_at - last["t"]).total_seconds()
-    if remaining <= 0:
+    if (resets_at - last["t"]).total_seconds() <= 0:
         return None
-    slope = (last["fable"] - first["fable"]) / span
+    slope = pace_slope(points, shares)
+    remaining = effective_hours(shares, last["t"], resets_at)
     projected = last["fable"] + slope * remaining
     projected = max(last["fable"], min(PROJECTION_MAX_PERCENT, projected))
     # Already past 100%: there is no future crossing to report, just the value.
     if projected > 100 and slope > 0 and last["fable"] < 100:
-        cross = last["t"] + timedelta(seconds=(100.0 - last["fable"]) / slope)
-        return ("cross", cross)
+        cross = advance_effective(shares, last["t"],
+                                  (100.0 - last["fable"]) / slope)
+        if cross is not None:
+            return ("cross", cross)
     return ("reset", projected)
 
 
@@ -326,7 +479,8 @@ def projection_row(state, now, history=None):
     if history is None:
         history = read_history()
     points = window_points(history, resets_at_text)
-    result = project(points, resets_at, now)
+    # 成分Bは履歴全体(全ての窓)から作る。作れなければ None = 成分Aのみ。
+    result = project(points, resets_at, now, shares=activity_curve(history))
     if result is None:
         # 状態は新しいのに履歴が足りないだけ: 収集中であることを出す。
         return "予測: データ収集中(%s)" % collecting_label(points, now)
