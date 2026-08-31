@@ -38,6 +38,10 @@ COLOR_WARN = "#e0a800"
 COLOR_CRIT = "#d0021b"
 COLOR_GRAY = "#8e8e93"
 COLOR_ERROR = "#d0021b"
+# SwiftBar は color=<light>,<dark> の二値指定に対応する。
+# 情報行は明示指定しないと無効行(淡いグレー)として描画されるため必ず付ける。
+COLOR_INFO = "#1d1d1f,#e8e8ed"
+COLOR_SECONDARY = "#6e6e73,#98989d"
 
 LABEL_WIDTH = 16
 
@@ -189,24 +193,26 @@ def render(state, now=None, python_path=None, fetch_path=None, log_path=LOG_PATH
                 ("セッション(5h)", data.get("five_hour")))
         for label, entry in rows:
             if not isinstance(entry, dict):
-                lines.append("%s --" % pad_label(label))
+                lines.append("%s -- | font=Menlo size=12 color=%s"
+                             % (pad_label(label), COLOR_INFO))
                 continue
             reset = fmt_reset(entry.get("resets_at"), now)
             lines.append(("%s %3s%%   %s" % (
                 pad_label(label), fmt_percent(entry.get("percent")), reset)).rstrip()
-                + " | font=Menlo size=12")
+                + " | font=Menlo size=12 color=%s" % COLOR_INFO)
         lines.append("---")
         plan = data.get("plan") or "-"
         age = age_seconds(state, now)
         fetched = parse_iso(state.get("fetched_at"))
         if fetched is not None:
             stamp = fetched.astimezone().strftime("%H:%M:%S")
-            lines.append("プラン: %s · 取得: %s (%s前)"
-                         % (plan, stamp, fmt_duration(age)))
+            lines.append("プラン: %s · 取得: %s (%s前) | color=%s"
+                         % (plan, stamp, fmt_duration(age), COLOR_SECONDARY))
         else:
-            lines.append("プラン: %s · 取得: なし" % plan)
+            lines.append("プラン: %s · 取得: なし | color=%s"
+                         % (plan, COLOR_SECONDARY))
     else:
-        lines.append("まだデータがありません | color=%s" % COLOR_GRAY)
+        lines.append("まだデータがありません | color=%s" % COLOR_SECONDARY)
         lines.append("---")
 
     if not isinstance(state, dict):

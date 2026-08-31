@@ -120,6 +120,30 @@ class RenderTest(unittest.TestCase):
                       "param2=--force terminal=false refresh=true", out)
         self.assertIn("ログを開く | bash=/usr/bin/open", out)
 
+    def test_info_rows_have_explicit_colors(self):
+        out = plugin.render(make_state(3), NOW, python_path="/p/python3",
+                            fetch_path="/r/fetch.py")
+        limit_rows = [ln for ln in out.split("\n")
+                      if ln.startswith(("Fable", "週間(全モデル)", "セッション(5h)"))]
+        self.assertEqual(len(limit_rows), 3)
+        for row in limit_rows:
+            self.assertIn("font=Menlo size=12", row)
+            self.assertIn("color=%s" % plugin.COLOR_INFO, row)
+        plan_row = [ln for ln in out.split("\n") if ln.startswith("プラン: ")]
+        self.assertEqual(len(plan_row), 1)
+        self.assertIn("color=%s" % plugin.COLOR_SECONDARY, plan_row[0])
+
+    def test_dual_mode_color_format(self):
+        self.assertEqual(plugin.COLOR_INFO, "#1d1d1f,#e8e8ed")
+        self.assertEqual(plugin.COLOR_SECONDARY, "#6e6e73,#98989d")
+
+    def test_no_data_row_uses_secondary_color(self):
+        state = make_state(0)
+        state["data"] = None
+        out = plugin.render(state, NOW)
+        self.assertIn("まだデータがありません | color=%s" % plugin.COLOR_SECONDARY,
+                      out)
+
     def test_error_row_rendered_in_red(self):
         out = plugin.render(make_state(3, ok=False, error="token_expired"), NOW)
         self.assertIn("エラー: token_expired", out)
