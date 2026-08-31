@@ -234,8 +234,9 @@ RESETS_AT = "2026-09-04T14:59:59+00:00"
 RESETS_DT = datetime(2026, 9, 4, 14, 59, 59, tzinfo=timezone.utc)
 
 
-def point(hours_ago, percent, resets_at=RESETS_AT):
+def point(hours_ago, percent, resets_at=RESETS_AT, seven_day=None):
     return {"t": NOW - timedelta(hours=hours_ago), "fable": float(percent),
+            "seven_day": None if seven_day is None else float(seven_day),
             "fable_resets_at": resets_at}
 
 
@@ -336,40 +337,67 @@ class WindowPointsTest(unittest.TestCase):
 
 class ProjectionRowTest(unittest.TestCase):
     def history(self):
-        return [point(12, 6), point(0, 12)]
+        return [point(12, 6, seven_day=4), point(0, 12, seven_day=8)]
 
-    def test_row_rendered_for_fresh_ok_state(self):
-        row = plugin.projection_row(make_state(0), NOW, self.history())
-        self.assertEqual(row, "予測: リセット時点 ~81%")
-        self.assertNotIn("color=", row)
+    def test_one_row_per_metric_for_a_fresh_ok_state(self):
+        rows = plugin.projection_rows(make_state(0), NOW, self.history())
+        # Fable: 0.5%/h * 137.9h -> 81。週間: 0.333%/h * 137.9h -> 54。
+        self.assertEqual(rows, ["予測 Fable      リセット時点 ~81%",
+                                "予測 週間       リセット時点 ~54%"])
+        for row in rows:
+            self.assertNotIn("color=", row)
+
+    def test_rows_line_up_with_the_limit_rows(self):
+        rows = plugin.projection_rows(make_state(0), NOW, self.history())
+        widths = {plugin.display_width(r.split("リセット時点")[0]) for r in rows}
+        self.assertEqual(widths, {plugin.LABEL_WIDTH})
 
     def test_crossing_row_text(self):
-        history = [point(10, 10), point(0, 50)]
-        row = plugin.projection_row(make_state(0, fable=50), NOW, history)
+        history = [point(10, 10, seven_day=10), point(0, 50, seven_day=50)]
+        rows = plugin.projection_rows(make_state(0, fable=50), NOW, history)
         expected = (NOW + timedelta(hours=12.5)).astimezone().strftime(
             "%-m/%-d %-H時")
-        self.assertEqual(row, "予測: 100%%到達 %sごろ" % expected)
+        self.assertEqual(rows[0],
+                         "予測 Fable      100%%到達 %sごろ" % expected)
+        self.assertTrue(rows[1].startswith("予測 週間       100%到達 "))
+
+    def test_seven_day_projects_from_its_own_values(self):
+        # 同じ点でも Fable と週間で伸び方が違えば別々の予測になる。
+        history = [point(12, 6, seven_day=1), point(0, 12, seven_day=2)]
+        rows = plugin.projection_rows(make_state(0), NOW, history)
+        self.assertEqual(rows[0], "予測 Fable      リセット時点 ~81%")
+        # 1%/12h = 0.0833%/h * 137.9h -> 2 + 11.5 = ~13%
+        self.assertEqual(rows[1], "予測 週間       リセット時点 ~13%")
+
+    def test_a_metric_without_history_values_shows_its_own_collecting_row(self):
+        # 片方だけ予測できるとき(履歴に seven_day が無い等)は混ぜて出す。
+        rows = plugin.projection_rows(make_state(0), NOW,
+                                      [point(12, 6), point(0, 12)])
+        self.assertEqual(rows, ["予測 Fable      リセット時点 ~81%",
+                                "予測 週間       データ収集中(あと約3時間)"])
 
     def test_collecting_row_without_any_history(self):
-        self.assertEqual(plugin.projection_row(make_state(0), NOW, []),
-                         "予測: データ収集中(あと約3時間)")
+        self.assertEqual(plugin.projection_rows(make_state(0), NOW, []),
+                         ["予測: データ収集中(あと約3時間)"])
 
     def test_collecting_row_counts_down_from_the_oldest_point(self):
         # One point 70 minutes old -> 1h50m short of the 3h span -> 2h.
-        row = plugin.projection_row(make_state(0), NOW,
-                                    [point(70 / 60.0, 10), point(0, 12)])
-        self.assertEqual(row, "予測: データ収集中(あと約2時間)")
+        rows = plugin.projection_rows(
+            make_state(0), NOW,
+            [point(70 / 60.0, 10, seven_day=8), point(0, 12, seven_day=9)])
+        self.assertEqual(rows, ["予測: データ収集中(あと約2時間)"])
 
     def test_collecting_row_never_drops_below_ten_minutes(self):
         # A single 5h-old point cannot span anything yet, but the next fetch can.
-        self.assertEqual(plugin.projection_row(make_state(0), NOW,
-                                               [point(5, 10)]),
-                         "予測: データ収集中(あと約10分)")
+        self.assertEqual(plugin.projection_rows(make_state(0), NOW,
+                                                [point(5, 10, seven_day=8)]),
+                         ["予測: データ収集中(あと約10分)"])
 
     def test_collecting_row_ignores_points_of_the_previous_window(self):
-        old = point(30, 90, resets_at="2026-08-28T14:59:59+00:00")
-        row = plugin.projection_row(make_state(0), NOW, [old, point(1, 12)])
-        self.assertEqual(row, "予測: データ収集中(あと約2時間)")
+        old = point(30, 90, resets_at="2026-08-28T14:59:59+00:00", seven_day=80)
+        rows = plugin.projection_rows(make_state(0), NOW,
+                                      [old, point(1, 12, seven_day=9)])
+        self.assertEqual(rows, ["予測: データ収集中(あと約2時間)"])
 
     def test_collecting_label_helper(self):
         self.assertEqual(plugin.collecting_label([], NOW), "あと約3時間")
@@ -397,50 +425,58 @@ class ProjectionRowTest(unittest.TestCase):
         self.assertEqual(plugin.collecting_label([point(119 / 60.0, 1)], NOW),
                          "あと約70分")
 
-    def test_no_row_when_stale(self):
-        self.assertIsNone(plugin.projection_row(make_state(11), NOW,
-                                                self.history()))
-        self.assertIsNone(plugin.projection_row(make_state(31), NOW,
-                                                self.history()))
+    def test_no_rows_when_stale(self):
+        self.assertEqual(plugin.projection_rows(make_state(11), NOW,
+                                                self.history()), [])
+        self.assertEqual(plugin.projection_rows(make_state(31), NOW,
+                                                self.history()), [])
 
-    def test_no_row_when_last_fetch_failed(self):
+    def test_no_rows_when_last_fetch_failed(self):
         state = make_state(1, ok=False, error="network_error")
-        self.assertIsNone(plugin.projection_row(state, NOW, self.history()))
+        self.assertEqual(plugin.projection_rows(state, NOW, self.history()), [])
 
-    def test_no_row_without_state_or_data(self):
-        self.assertIsNone(plugin.projection_row(None, NOW, self.history()))
+    def test_no_rows_without_state_or_data(self):
+        self.assertEqual(plugin.projection_rows(None, NOW, self.history()), [])
         state = make_state(0)
         state["data"] = None
-        self.assertIsNone(plugin.projection_row(state, NOW, self.history()))
+        self.assertEqual(plugin.projection_rows(state, NOW, self.history()), [])
 
-    def test_no_row_without_resets_at(self):
+    def test_metric_without_resets_at_is_dropped(self):
         state = make_state(0)
         state["data"]["fable"]["resets_at"] = None
-        self.assertIsNone(plugin.projection_row(state, NOW, self.history()))
+        rows = plugin.projection_rows(state, NOW, self.history())
+        self.assertEqual(rows, ["予測 週間       リセット時点 ~54%"])
+        state["data"]["seven_day"]["resets_at"] = None
+        self.assertEqual(plugin.projection_rows(state, NOW, self.history()), [])
 
-    def test_no_row_once_the_reset_has_passed(self):
+    def test_no_rows_once_the_resets_have_passed(self):
         state = make_state(0)
-        state["data"]["fable"]["resets_at"] = (
-            NOW - timedelta(hours=1)).isoformat()
-        self.assertIsNone(plugin.projection_row(state, NOW, self.history()))
+        past = (NOW - timedelta(hours=1)).isoformat()
+        state["data"]["fable"]["resets_at"] = past
+        state["data"]["seven_day"]["resets_at"] = past
+        self.assertEqual(plugin.projection_rows(state, NOW, self.history()), [])
 
-    def test_render_places_the_row_after_the_three_limit_rows(self):
+    def test_render_places_the_rows_after_the_three_limit_rows(self):
         out = plugin.render(make_state(0), NOW, python_path="/p/python3",
                             fetch_path="/r/fetch.py", history=self.history())
         lines = out.split("\n")
         self.assertTrue(lines[4].startswith("セッション(5h)"))
-        self.assertTrue(lines[5].startswith("予測: "))
-        self.assertEqual(lines[6], "---")
+        self.assertTrue(lines[5].startswith("予測 Fable"))
+        self.assertTrue(lines[6].startswith("予測 週間"))
+        # 3 枠と桁を揃えるため予測行も等幅にする。
+        self.assertTrue(lines[5].endswith("| " + plugin.MONO))
+        self.assertEqual(lines[7], "---")
 
     def test_render_shows_the_collecting_row_without_history(self):
         out = plugin.render(make_state(0), NOW, python_path="/p/python3",
                             fetch_path="/r/fetch.py", history=[])
-        self.assertIn("\n予測: データ収集中(あと約3時間)\n", out)
+        self.assertIn("\n予測: データ収集中(あと約3時間) | " + plugin.MONO + "\n",
+                      out)
 
-    def test_render_omits_the_row_for_a_stale_state(self):
+    def test_render_omits_the_rows_for_a_stale_state(self):
         out = plugin.render(make_state(11), NOW, python_path="/p/python3",
                             fetch_path="/r/fetch.py", history=[])
-        self.assertNotIn("予測:", out)
+        self.assertNotIn("予測", out)
 
 
 class HistoryReadTest(unittest.TestCase):
@@ -488,8 +524,10 @@ def aligned(dt):
     return local.replace(minute=0, second=0, microsecond=0)
 
 
-def at(when, percent, resets_at=RESETS_AT):
-    return {"t": when, "fable": float(percent), "fable_resets_at": resets_at}
+def at(when, percent, resets_at=RESETS_AT, seven_day=None):
+    return {"t": when, "fable": float(percent),
+            "seven_day": None if seven_day is None else float(seven_day),
+            "fable_resets_at": resets_at}
 
 
 def flat_curve():
@@ -724,29 +762,111 @@ class ProjectionGateTest(unittest.TestCase):
 
     def history(self, hours):
         start = self.now - timedelta(hours=hours)
-        return [at(start + timedelta(hours=h), h * 0.1, resets_at=self.resets)
+        return [at(start + timedelta(hours=h), h * 0.1, resets_at=self.resets,
+                   seven_day=h * 0.05)
                 for h in range(int(hours) + 1)]
 
     def test_short_history_falls_back_to_component_a(self):
         history = self.history(6)
         self.assertIsNone(plugin.activity_curve(history))
-        row = plugin.projection_row(self.state(6), self.now, history)
+        self.assertIsNone(plugin.activity_curve(history, "seven_day"))
+        rows = plugin.projection_rows(self.state(6), self.now, history)
         kind, value = plugin.project(history, plugin.parse_iso(self.resets),
                                      self.now)
         self.assertEqual(kind, "reset")
-        self.assertEqual(row, "予測: リセット時点 ~%d%%" % round(value))
+        self.assertEqual(rows[0], "%sリセット時点 ~%d%%"
+                         % (plugin.pad_label("予測 Fable"), round(value)))
 
-    def test_long_history_activates_the_curve(self):
+    def test_long_history_activates_the_curve_for_both_metrics(self):
         history = self.history(30)
         self.assertIsNotNone(plugin.activity_curve(history))
-        row = plugin.projection_row(self.state(30), self.now, history)
-        self.assertTrue(row.startswith("予測: "))
-        self.assertNotIn("収集中", row)
+        self.assertIsNotNone(plugin.activity_curve(history, "seven_day"))
+        rows = plugin.projection_rows(self.state(30), self.now, history)
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            self.assertTrue(row.startswith("予測 "))
+            self.assertNotIn("収集中", row)
 
     def test_two_hours_of_history_is_still_collecting(self):
         history = self.history(2)
-        row = plugin.projection_row(self.state(2), self.now, history)
-        self.assertTrue(row.startswith("予測: データ収集中("))
+        rows = plugin.projection_rows(self.state(2), self.now, history)
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0].startswith("予測: データ収集中("))
+
+
+# --------------------------------------------------- 指標ごとのパイプライン
+
+class SevenDayMetricTest(unittest.TestCase):
+    """予測パイプラインは指標名だけを差し替えて再利用する。"""
+
+    def test_slope_uses_the_requested_metric(self):
+        points = [point(12, 6, seven_day=1), point(0, 12, seven_day=4)]
+        self.assertAlmostEqual(plugin.pace_slope(points), 0.5, places=9)
+        self.assertAlmostEqual(plugin.pace_slope(points, field="seven_day"),
+                               0.25, places=9)
+
+    def test_projection_uses_the_requested_metric(self):
+        points = [point(12, 6, seven_day=1), point(0, 12, seven_day=4)]
+        resets = NOW + timedelta(hours=10)
+        self.assertEqual(plugin.project(points, resets, NOW),
+                         ("reset", 17.0))
+        self.assertEqual(plugin.project(points, resets, NOW,
+                                        field="seven_day"),
+                         ("reset", 6.5))
+
+    def test_samples_without_a_seven_day_value_are_skipped(self):
+        # API が seven_day に null を返した点は、その指標の窓には入らない。
+        points = [point(12, 6, seven_day=1), point(6, 9), point(0, 12,
+                                                                seven_day=4)]
+        self.assertEqual(len(plugin.window_points(points, RESETS_AT)), 3)
+        kept = plugin.window_points(points, RESETS_AT, "seven_day")
+        self.assertEqual([p["seven_day"] for p in kept], [1.0, 4.0])
+
+    def test_reset_is_detected_from_the_seven_day_drop(self):
+        # fable は下がっていないが seven_day が下がっている = 週間側のリセット。
+        pts = [point(12, 4, seven_day=80), point(6, 8, seven_day=2),
+               point(0, 12, seven_day=5)]
+        self.assertEqual(plugin.window_points(pts, RESETS_AT), pts)
+        self.assertEqual(plugin.window_points(pts, RESETS_AT, "seven_day"),
+                         pts[1:])
+
+    def test_curve_is_built_from_the_metric_deltas(self):
+        base = aligned(NOW) - timedelta(days=2)
+        # fable は 1 時間目に、seven_day は 2 時間目にだけ伸びる。
+        entries = [at(base, 0, seven_day=0),
+                   at(base + timedelta(hours=1), 3, seven_day=0),
+                   at(base + timedelta(hours=2), 3, seven_day=3),
+                   at(base + timedelta(hours=30), 3, seven_day=3)]
+        fable = plugin.activity_curve(entries)
+        weekly = plugin.activity_curve(entries, "seven_day")
+        self.assertAlmostEqual(fable[base.hour], 1.0, places=9)
+        self.assertAlmostEqual(weekly[(base.hour + 1) % 24], 1.0, places=9)
+
+    def test_curve_gates_apply_per_metric(self):
+        base = aligned(NOW) - timedelta(days=2)
+        # 24 時間以上あるが seven_day は一度も伸びていない -> 週間だけカーブ無し。
+        entries = [at(base, 0, seven_day=5),
+                   at(base + timedelta(hours=1), 3, seven_day=5),
+                   at(base + timedelta(hours=30), 3, seven_day=5)]
+        self.assertIsNotNone(plugin.activity_curve(entries))
+        self.assertIsNone(plugin.activity_curve(entries, "seven_day"))
+
+    def test_history_keeps_the_seven_day_column(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "history.jsonl")
+            rows = [
+                json.dumps({"t": (NOW - timedelta(hours=1)).isoformat(),
+                            "fable": 11, "seven_day": 7,
+                            "fable_resets_at": RESETS_AT}),
+                json.dumps({"t": NOW.isoformat(), "fable": 12,
+                            "seven_day": None,
+                            "fable_resets_at": RESETS_AT}),
+            ]
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(rows) + "\n")
+            entries = plugin.read_history(path)
+            self.assertEqual([e["seven_day"] for e in entries], [7.0, None])
+            self.assertEqual(len(plugin.metric_entries(entries, "seven_day")), 1)
 
 
 if __name__ == "__main__":

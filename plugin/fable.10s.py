@@ -100,6 +100,9 @@ LABEL_WIDTH = 16
 # 等幅で桁を揃えるための共通パラメータ。
 MONO = "font=Menlo size=12"
 
+# 予測パイプラインが既定で見る history.jsonl の値のキー。
+DEFAULT_METRIC = "fable"
+
 # ペース予測: 現在の窓に 2 点以上あり、その間隔が 3 時間以上あるときだけ出す。
 PROJECTION_MIN_POINTS = 2
 PROJECTION_MIN_SPAN_SECONDS = 3 * 3600
@@ -219,11 +222,17 @@ def read_history(path=HISTORY_PATH, max_lines=HISTORY_MAX_LINES):
         if stamp is None or isinstance(percent, bool) \
                 or not isinstance(percent, (int, float)):
             continue
-        entries.append({
+        record = {
             "t": stamp,
             "fable": float(percent),
             "fable_resets_at": entry.get("fable_resets_at"),
-        })
+        }
+        weekly = entry.get("seven_day")
+        # seven_day は取れないことがある(API が null を返す)。欠測は None のまま
+        # 残し、その指標のパイプラインだけがその点を捨てる。
+        record["seven_day"] = None if isinstance(weekly, bool) \
+            or not isinstance(weekly, (int, float)) else float(weekly)
+        entries.append(record)
     entries.sort(key=lambda e: e["t"])
     return entries
 
@@ -247,24 +256,43 @@ def reset_key(text):
     return int((dt.timestamp() + 30) // 60)
 
 
-def window_points(entries, resets_at):
+# 予測を出す指標。history.jsonl の値のキーと、行に出すラベル。
+PROJECTION_METRICS = (("fable", "Fable"), ("seven_day", "週間"))
+
+
+def metric_entries(entries, field=DEFAULT_METRIC):
+    """Drop the samples that have no value for `field` (seven_day can be null)."""
+    return [e for e in (entries or [])
+            if e.get("t") is not None
+            and not isinstance(e.get(field), bool)
+            and isinstance(e.get(field), (int, float))]
+
+
+def window_points(entries, resets_at, field=DEFAULT_METRIC):
     """Keep only the points belonging to the current window.
 
     Walking backwards from the newest point, stop at the first entry whose
     resets_at differs from the current one, or whose percent is *higher* than
     the point after it -- going forward that is a drop, i.e. a weekly reset.
+
+    The window key is always the entry's `fable_resets_at`: history.jsonl stores
+    only that one resets_at, and Fable (...14:59:59.x) and seven_day
+    (...15:00:00.x) are the same weekly boundary, which `reset_key`'s
+    round-to-nearest-minute maps onto the same key. So the stored field is a
+    valid discriminator for both metrics and the schema stays unchanged.
+    The %-drop check uses `field`, so each metric detects its own reset.
     """
     points = []
     newer_percent = None
     target = reset_key(resets_at)
-    for entry in reversed(entries or []):
+    for entry in reversed(metric_entries(entries, field)):
         entry_key = reset_key(entry.get("fable_resets_at"))
         if target is not None and entry_key is not None and entry_key != target:
             break
-        if newer_percent is not None and entry["fable"] > newer_percent:
+        if newer_percent is not None and entry[field] > newer_percent:
             break
         points.append(entry)
-        newer_percent = entry["fable"]
+        newer_percent = entry[field]
     points.reverse()
     return points
 
@@ -289,7 +317,7 @@ def hour_segments(start, end):
         steps += 1
 
 
-def activity_curve(entries):
+def activity_curve(entries, field=DEFAULT_METRIC):
     """24-bucket hour-of-day activity profile, or None when it cannot be built.
 
     Every pair of consecutive samples inside one window contributes its delta%
@@ -300,7 +328,7 @@ def activity_curve(entries):
     Gates: at least CURVE_MIN_SPAN_SECONDS of history overall and a positive
     total delta. Otherwise None (component B is inactive).
     """
-    entries = [e for e in (entries or []) if e.get("t") is not None]
+    entries = metric_entries(entries, field)
     if len(entries) < 2:
         return None
     if (entries[-1]["t"] - entries[0]["t"]).total_seconds() \
@@ -311,7 +339,7 @@ def activity_curve(entries):
         if reset_key(prev.get("fable_resets_at")) \
                 != reset_key(nxt.get("fable_resets_at")):
             continue  # 窓をまたぐ差分は消費ではない。
-        delta = nxt["fable"] - prev["fable"]
+        delta = nxt[field] - prev[field]
         if delta <= 0:
             continue
         span = (nxt["t"] - prev["t"]).total_seconds() / 3600.0
@@ -389,7 +417,7 @@ def weighted_slope(xs, ys, ages_hours, half_life=SLOPE_HALF_LIFE_HOURS):
     return (sw * sxy - sx * sy) / denom
 
 
-def pace_slope(points, shares=None):
+def pace_slope(points, shares=None, field=DEFAULT_METRIC):
     """Component A: %/hour of *effective* time (wallclock when shares is None).
 
     Timestamps are mapped to effective hours elapsed with the same curve used
@@ -400,12 +428,12 @@ def pace_slope(points, shares=None):
     base = points[0]["t"]
     last = points[-1]["t"]
     xs = [effective_hours(shares, base, p["t"]) for p in points]
-    ys = [p["fable"] for p in points]
+    ys = [p[field] for p in points]
     ages = [(last - p["t"]).total_seconds() / 3600.0 for p in points]
     return max(0.0, weighted_slope(xs, ys, ages))
 
 
-def project(points, resets_at, now=None, shares=None):
+def project(points, resets_at, now=None, shares=None, field=DEFAULT_METRIC):
     """Pace projection for the current window.
 
     Component A (recency-weighted slope) always; component B (daily activity
@@ -423,14 +451,14 @@ def project(points, resets_at, now=None, shares=None):
         return None
     if (resets_at - last["t"]).total_seconds() <= 0:
         return None
-    slope = pace_slope(points, shares)
+    slope = pace_slope(points, shares, field)
     remaining = effective_hours(shares, last["t"], resets_at)
-    projected = last["fable"] + slope * remaining
-    projected = max(last["fable"], min(PROJECTION_MAX_PERCENT, projected))
+    projected = last[field] + slope * remaining
+    projected = max(last[field], min(PROJECTION_MAX_PERCENT, projected))
     # Already past 100%: there is no future crossing to report, just the value.
-    if projected > 100 and slope > 0 and last["fable"] < 100:
+    if projected > 100 and slope > 0 and last[field] < 100:
         cross = advance_effective(shares, last["t"],
-                                  (100.0 - last["fable"]) / slope)
+                                  (100.0 - last[field]) / slope)
         if cross is not None:
             return ("cross", cross)
     return ("reset", projected)
@@ -459,36 +487,73 @@ def collecting_label(points, now):
     return "あと約%d分" % minutes
 
 
-def projection_row(state, now, history=None):
-    """The 予測 line, or None when the state itself does not support one."""
-    if not isinstance(state, dict) or state.get("ok") is not True:
+def projection_result(data, now, history, field):
+    """(kind, value) for one metric, or None when its resets_at is unusable.
+
+    kind is "collecting" (value = the current window's points), "reset"
+    (value = percent expected at the reset) or "cross" (value = datetime).
+    """
+    entry = data.get(field)
+    if not isinstance(entry, dict):
         return None
-    age = age_seconds(state, now)
-    if age is None or age >= STALE_SECONDS:
-        return None
-    data = state.get("data")
-    if not isinstance(data, dict):
-        return None
-    fable = data.get("fable")
-    if not isinstance(fable, dict):
-        return None
-    resets_at_text = fable.get("resets_at")
+    resets_at_text = entry.get("resets_at")
     resets_at = parse_iso(resets_at_text)
     if resets_at is None or (resets_at - now).total_seconds() <= 0:
         return None
-    if history is None:
-        history = read_history()
-    points = window_points(history, resets_at_text)
+    points = window_points(history, resets_at_text, field)
     # 成分Bは履歴全体(全ての窓)から作る。作れなければ None = 成分Aのみ。
-    result = project(points, resets_at, now, shares=activity_curve(history))
+    result = project(points, resets_at, now, activity_curve(history, field),
+                     field)
     if result is None:
         # 状態は新しいのに履歴が足りないだけ: 収集中であることを出す。
-        return "予測: データ収集中(%s)" % collecting_label(points, now)
-    kind, value = result
+        return ("collecting", points)
+    return result
+
+
+def projection_text(kind, value):
+    if kind == "collecting":
+        return None
     if kind == "cross":
-        local = value.astimezone()
-        return "予測: 100%%到達 %sごろ" % local.strftime("%-m/%-d %-H時")
-    return "予測: リセット時点 ~%d%%" % int(round(value))
+        return "100%%到達 %sごろ" % value.astimezone().strftime("%-m/%-d %-H時")
+    return "リセット時点 ~%d%%" % int(round(value))
+
+
+def projection_rows(state, now, history=None):
+    """The 予測 lines (one per metric), or [] when the state supports none.
+
+    Both metrics are projected the same way; only the metric field and its own
+    resets_at differ. When every metric is still collecting, the two rows
+    collapse into one 「データ収集中」 row -- the countdown is identical because
+    the samples are.
+    """
+    if not isinstance(state, dict) or state.get("ok") is not True:
+        return []
+    age = age_seconds(state, now)
+    if age is None or age >= STALE_SECONDS:
+        return []
+    data = state.get("data")
+    if not isinstance(data, dict):
+        return []
+    if history is None:
+        history = read_history()
+
+    results = []
+    for field, label in PROJECTION_METRICS:
+        result = projection_result(data, now, history, field)
+        if result is not None:
+            results.append((label, result))
+    if not results:
+        return []
+    if all(kind == "collecting" for _, (kind, _) in results):
+        # 収集中の残り時間は全指標で同じ(点の時刻が同じ)ので 1 行にまとめる。
+        points = results[0][1][1]
+        return ["予測: データ収集中(%s)" % collecting_label(points, now)]
+    rows = []
+    for label, (kind, value) in results:
+        text = projection_text(kind, value) \
+            or "データ収集中(%s)" % collecting_label(value, now)
+        rows.append("%s%s" % (pad_label("予測 " + label), text))
+    return rows
 
 
 def build_title(state, now):
@@ -570,9 +635,9 @@ def render(state, now=None, python_path=None, fetch_path=None, log_path=LOG_PATH
             text = ("%s %3s%%   %s" % (
                 pad_label(label), fmt_percent(entry.get("percent")), reset)).rstrip()
             lines.append(ansi_row(text, primary, MONO))
-        projection = projection_row(state, now, history)
-        if projection:
-            lines.append(projection)
+        # 予測行も等幅にしないと 3 枠の行と桁が揃わない。色もアクションも付けない。
+        for projection in projection_rows(state, now, history):
+            lines.append(ansi_row(projection, None, MONO))
         lines.append("---")
         age = age_seconds(state, now)
         fetched = parse_iso(state.get("fetched_at"))
