@@ -6,3 +6,4 @@ state.json
 .DS_Store
 launchd/com.local.fable-meter.plist
 history.jsonl
+drafts/
