@@ -68,7 +68,7 @@ Claude Code の週間使用量、特に **Fable のモデル別制限** を macO
 ### 表示層に SwiftBar を使う理由
 
 自前で SwiftUI の `MenuBarExtra` アプリを書いてもいいが、配布しないなら SwiftBar にスクリプトを置くだけで済む。
-署名・公証・Gatekeeper の問題が**まるごと消える**(今回 CC Usage Bar が XProtect に検知されて詰んだ経緯があるため、この点は重要)。
+署名・公証・Gatekeeper の問題が**まるごと消える**(手元の環境で署名まわりの問題に当たった経緯があるため、この点は重要)。
 
 ```
 brew install --cask swiftbar

@@ -1,5 +1,60 @@
 # fable-meter
 
+> **In short (English).** fable-meter is an **unofficial**, personal macOS menu-bar
+> tool that shows your Claude Code usage — in particular the weekly per-model
+> quota for **Fable** — which existing meters do not surface. It is **not
+> affiliated with, endorsed by, or supported by Anthropic**, and it relies on an
+> **undocumented endpoint that may break or disappear at any time**. It reads the
+> Claude Code OAuth token from your macOS Keychain, keeps it **in process memory
+> only** — never written to any file, log, argument, or environment variable —
+> and issues a single **read-only `GET`**, so it consumes **no** usage quota of
+> its own. The whole thing is a few hundred lines of dependency-free Python, so
+> you can read it yourself before trusting it. Provided as-is under the MIT
+> license, with **no support and no guarantees**. Requires macOS, a logged-in
+> Claude Code, and Homebrew.
+
+## 読む前に(重要)
+
+### 非公式ツールです
+
+- **Anthropic とは一切関係ありません。** 個人が自分用に作ったもので、公式の承認・提携・支援は受けていません。
+- 公開されていない内部エンドポイント(`GET https://api.anthropic.com/api/oauth/usage`)を利用しています。
+  **仕様変更や廃止でいつ動かなくなってもおかしくありません。** 壊れたときは黙って古い値を出さず、
+  エラーとして表示する設計にしてあります(→ [表示の読み方](#表示の読み方))。
+
+### セキュリティ設計
+
+- Claude Code の OAuth トークンを macOS Keychain(`Claude Code-credentials`)から読み取ります。
+- 読み取ったトークンは **プロセス内のメモリ上でのみ** 扱います。
+  **ファイル・ログ・stdout / stderr・コマンドライン引数・環境変数・例外メッセージの
+  いずれにも一切書き出しません。** `state.json` にも `--dry-run` の出力にも含まれません。
+- トークンの送信先は `https://api.anthropic.com` のみです。外部に送る処理はありません。
+- キャッシュは `~/.cache/fable-meter/`(ディレクトリ `0700`、`state.json` と `fetch.log` は `0600`)。
+- ログに残るのは時刻・結果コード・HTTP ステータス・エラー時のレスポンス本文先頭 300 文字だけです。
+- **コードは短く、依存パッケージはゼロ**(Python 3 標準ライブラリのみ)。
+  取得層 `fetch.py` と表示層 `plugin/fable.10s.py` を読めば、上記を自分の目で検証できます。
+  他人の Keychain を触るツールなので、**信用する前に読んでください。**
+
+### 使用量は消費しません
+
+呼ぶのは読み取り専用の **`GET` 1本だけ**です。推論リクエストは一切発生しないため、
+このツール自体が使用量(トークン)を消費することはありません。
+
+### 個人用ツールです
+
+作者が自分のために書いたものを、参考になればと公開しているだけです。
+**サポート・動作保証・継続的なメンテナンスの約束はありません。** MIT ライセンス、無保証(as-is)で提供します。
+Issue や PR に反応できないことがあります。自己責任でご利用ください。
+
+### 動作要件
+
+- **macOS**(Apple Silicon で確認。launchd / SwiftBar / Keychain に依存するため macOS 専用)
+- **Claude Code にログイン済み**であること(Keychain に認証情報があること)
+- **Homebrew**(SwiftBar の導入に使用)
+- Python 3(macOS 同梱の `/usr/bin/python3` か Homebrew の `python3`)
+
+---
+
 Claude Code の使用量 — 特に **Fable の週次モデル別枠** — を macOS のメニューバーに常時表示する小さなツール。
 
 `ClaudeMeter` などが参照しているエンドポイントは `seven_day_*` の固定キーしか返さず Fable が取れないため、
@@ -148,3 +203,7 @@ python3 -m unittest discover tests
 
 - Python 3 標準ライブラリのみ。3.9+ 互換(プラグインが `/usr/bin/python3` で走る場合に備える)。
 - 設計の詳細は `DESIGN.md`、元の要件は `fable-usage-menubar-spec.md`。
+
+## ライセンス
+
+MIT License — [LICENSE](LICENSE) を参照。無保証(as-is)です。

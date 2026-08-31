@@ -52,10 +52,17 @@ fi
 # 5. launchd
 say "launchd エージェントを登録します"
 mkdir -p "$HOME/Library/LaunchAgents"
-sed -e "s|__PYTHON__|$PYTHON|g" \
-    -e "s|__REPO__|$REPO|g" \
-    -e "s|__HOME__|$HOME|g" \
-    "$REPO/launchd/$LABEL.plist.template" > "$PLIST"
+# テンプレート置換は python3 に任せる(パスに | & < > " が含まれても壊れないよう
+# sed のメタ文字ではなく固定文字列置換 + XML エスケープを使う)。
+"$PYTHON" - "$REPO/launchd/$LABEL.plist.template" "$PLIST" "$PYTHON" "$REPO" "$HOME" <<'PYEOF'
+import sys
+from xml.sax.saxutils import escape
+src, dst, python, repo, home = sys.argv[1:6]
+text = open(src, encoding="utf-8").read()
+for key, value in (("__PYTHON__", python), ("__REPO__", repo), ("__HOME__", home)):
+    text = text.replace(key, escape(value))
+open(dst, "w", encoding="utf-8").write(text)
+PYEOF
 launchctl bootout "gui/$UID_NUM/$LABEL" 2>/dev/null || true
 launchctl bootstrap "gui/$UID_NUM" "$PLIST"
 
@@ -69,11 +76,22 @@ mkdir -p "$PLUGIN_DIR"
 DEST="$PLUGIN_DIR/fable.10s.py"
 # shebang を絶対パスに書き換えたコピーを置く(SwiftBar が PATH を継承しない環境向け)
 rm -f "$DEST"
-{
-    printf '#!%s\n' "$PYTHON"
-    tail -n +2 "$REPO/plugin/fable.10s.py" \
-        | sed -e "s|^FETCH_PATH = \"\"$|FETCH_PATH = \"$REPO/fetch.py\"|"
-} > "$DEST"
+# shebang と FETCH_PATH の埋め込みも python3 で行う(パスをそのまま Python の
+# 文字列リテラルへ差し込むと任意コード混入になりうるため repr() で安全に囲む)。
+"$PYTHON" - "$REPO/plugin/fable.10s.py" "$DEST" "$PYTHON" "$REPO/fetch.py" <<'PYEOF'
+import os, sys
+src, dst, python, fetch = sys.argv[1:5]
+lines = open(src, encoding="utf-8").read().splitlines(True)
+lines[0] = "#!" + python + "\n"
+out = []
+for line in lines:
+    if line.rstrip("\n") == 'FETCH_PATH = ""':
+        line = "FETCH_PATH = %r\n" % fetch
+    out.append(line)
+fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o755)
+with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    fh.write("".join(out))
+PYEOF
 chmod +x "$DEST"
 say "プラグインを配置しました: $DEST"
 

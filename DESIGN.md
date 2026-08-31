@@ -14,7 +14,7 @@
 | メニューバー表示 | 短縮形 `F12% W9% S6%` |
 | 取得間隔 | 5分(launchd)+ ドロップダウンの `Refresh now` |
 | プロジェクト名 | `fable-meter`(キャッシュ `~/.cache/fable-meter/`、launchd ラベル `com.local.fable-meter`) |
-| リポジトリ | git 管理、GitHub **private** |
+| リポジトリ | git 管理、GitHub 公開(MIT)。当初は private 前提だった |
 
 ## 1. 調査結果(2026-08-29 実測)
 
@@ -81,7 +81,7 @@ SwiftBar (10秒ごと)
 ## 3. リポジトリ構成
 
 ```
-claude-usage-tracker/          (GitHub: fable-meter, private)
+claude-usage-tracker/          (GitHub: fable-meter)
 ├── README.md                  使い方・インストール・アンインストール・トラブルシュート
 ├── DESIGN.md                  本書
 ├── fable-usage-menubar-spec.md 元の要件(org_uuid の記載は削除する)

@@ -22,6 +22,9 @@ from datetime import datetime, timezone
 SCHEMA = 1
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 KEYCHAIN_SERVICE = "Claude Code-credentials"
+# Absolute paths only: never resolve helper binaries through $PATH.
+SECURITY_BIN = "/usr/bin/security"
+SYSCTL_BIN = "/usr/sbin/sysctl"
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "fable-meter")
 STATE_PATH = os.path.join(CACHE_DIR, "state.json")
 LOG_PATH = os.path.join(CACHE_DIR, "fetch.log")
@@ -41,18 +44,34 @@ class FetchError(Exception):
 
 # --------------------------------------------------------------------------- log
 
-def _ensure_cache_dir():
-    os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
+def _ensure_private_dir(path=CACHE_DIR):
+    """Create `path` 0700 and re-assert the mode if it already existed."""
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+
+
+def _open_private(path, mode):
+    """Open `path` for writing with 0600 from the moment of creation."""
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if mode == "a" else os.O_TRUNC)
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    except OSError:
+        pass
+    return os.fdopen(fd, mode, encoding="utf-8")
 
 
 def log(message, verbose=False):
     """Append a line to fetch.log. Callers must never pass token material."""
     line = "%s %s" % (datetime.now(timezone.utc).astimezone().isoformat(), message)
     try:
-        _ensure_cache_dir()
+        _ensure_private_dir()
         if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > LOG_MAX_BYTES:
             os.replace(LOG_PATH, LOG_PATH + ".1")
-        with open(LOG_PATH, "a", encoding="utf-8") as fh:
+        with _open_private(LOG_PATH, "a") as fh:
             fh.write(line + "\n")
     except OSError:
         pass
@@ -89,7 +108,7 @@ def recently_woke(now=None):
     now = time.time() if now is None else now
     try:
         out = subprocess.run(
-            ["/usr/sbin/sysctl", "-n", "kern.waketime"],
+            [SYSCTL_BIN, "-n", "kern.waketime"],
             capture_output=True, text=True, timeout=5,
         ).stdout
     except (OSError, subprocess.SubprocessError):
@@ -106,7 +125,7 @@ def read_token():
     """Return (access_token, expires_at_ms, plan). Never log or print the token."""
     try:
         proc = subprocess.run(
-            ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
+            [SECURITY_BIN, "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
             capture_output=True, text=True, timeout=60,
         )
     except (OSError, subprocess.SubprocessError):
@@ -328,12 +347,12 @@ def build_error_state(code, previous=None, now=None):
 
 def write_state(state, path=STATE_PATH):
     directory = os.path.dirname(path)
-    os.makedirs(directory, mode=0o700, exist_ok=True)
+    if directory:
+        _ensure_private_dir(directory)
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
+    with _open_private(tmp, "w") as fh:
         json.dump(state, fh, ensure_ascii=False, indent=2)
         fh.write("\n")
-    os.chmod(tmp, 0o600)
     os.replace(tmp, path)
 
 
