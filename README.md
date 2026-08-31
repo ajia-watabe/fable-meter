@@ -155,9 +155,19 @@ Fable             13%   リセット 9/4 23:59 (あと6日2時間)
 上半分は**状態表示**なので、クリックできない項目として出す。操作できるのは下の 3 行だけ。
 
 SwiftBar は `color=` を付けた行を自動的にクリック可能な項目に変えてしまう
-(`MenuBarItem.configureAction()`: `if params.hasAction || params.color != nil { item.action = ... }`)。
+(`buildMenuItem()`: `let needsAction = params.hasAction || params.color != nil`、
+SwiftBar v2.1.1 `SwiftBar/MenuBar/MenuBarItem.swift:1518`)。
 そこで状態表示の行は `color=` を使わず、**`ansi=true` + ANSI エスケープ**で色を付けている。
-`ansi` はアクションの有無に関わらないので、色が付いたままホバーでハイライトしない。
+`ansi` は `hasAction` にも `color` にも影響しないので、行は**無効項目のまま色が付く**
+(実測: 開いたメニューを Accessibility で読むと状態表示行は `enabled=false`、
+操作行 3 つだけが `enabled=true`)。
+
+**ただし macOS 26(Tahoe)では、無効項目でもポインタを載せると紫のハイライトが描かれる。**
+これは AppKit 側の描画で、`color=` を外しても `ansi` にしても、`予測:`/`取得:` のように
+色を一切付けていない行でも同じように出る(macOS 26.3 / SwiftBar 2.1.1 で全行を実測)。
+クリックは効かない(無効項目のまま)が、ハイライト自体はプラグイン側からも
+SwiftBar 側からも消せない。SwiftBar の最新リリースも未リリースの main も
+この判定ロジックは同じなので、アップグレードでも解決しない。
 
 - 3 枠の行: ダークのとき ANSI 256 色 189(ほぼ白)で本文色に上げる。
   ライトは ANSI パレットに「黒に近い有彩色」が無いのでデフォルトのまま。

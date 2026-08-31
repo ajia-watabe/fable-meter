@@ -187,13 +187,28 @@ claude-usage-tracker/          (GitHub: fable-meter)
 ## 5. 表示層 `plugin/fable.10s.py`
 
 - ドロップダウンの状態表示行(3枠・予測・取得・エラー・データ無し)には **`color=` を付けない**。
-  SwiftBar の `MenuBarItem.configureAction()` は
-  `if params.hasAction || params.color != nil { item.target = self; item.action = ... }`
-  (`SwiftBar/MenuBar/MenuBarItem.swift:1012`)なので、`color=` を付けただけの行も
-  クリック可能な項目になり、ホバーで選択ハイライトが出る
-  (SwiftBar に `disabled=` 相当のパラメータは無い)。
+  SwiftBar v2.1.1 の `buildMenuItem()` / `patchMenuItem()` は
+  `let needsAction = params.hasAction || params.color != nil` で
+  `#selector(perfomMenutItemAction)` を割り当てる
+  (`SwiftBar/MenuBar/MenuBarItem.swift:1518`、`:973`。タグ `v2.1.1` = build 597 = 現在の
+  最新リリースであり、未リリースの main も同じロジック)ので、`color=` を付けただけの行も
+  クリック可能な項目になる(SwiftBar に `disabled=` 相当のパラメータは無い)。
 - 色は **`ansi=true` + ANSI エスケープ**で付ける。`ansi` は `hasAction` にも `color` にも
-  影響しないので、**色付き かつ アクション無し(=ハイライトしない)** が両立する。
+  影響しないので、**色付き かつ アクション無し(=クリック不可)** が両立する。
+  検証: メニューを開いた状態で Accessibility から読むと、状態表示行は全て
+  `enabled=false`、操作行 3 つだけが `enabled=true`。
+
+### macOS 26 のハイライトについて(既知の制約)
+
+macOS 26(Tahoe、実測 26.3 / build 25D125)では、**無効な `NSMenuItem` でもポインタを
+載せると選択ハイライト(紫)が描かれる**。`color=` の有無・`ansi` の有無とは無関係で、
+色を一切付けていない `予測:` / `取得:` 行でも同じように出ることを全行で実測した。
+クリックは無効のまま効かないが、ハイライトの抑止は
+- プラグイン側の出力(SwiftBar には `disabled=` が無い)
+- SwiftBar のバージョン(最新リリース 2.1.1 も main も判定は同じ)
+
+のどちらでも不可能。将来 SwiftBar 側で fold 行のようなカスタム `NSView` 描画
+(`FoldableMenuItemView`)が一般の行にも使えるようになれば回避できる可能性がある。
   `atributedTitle()` は `params.ansi` のとき `params.color` の上書きをせず
   (`MenuBarItem.swift:1556-1566`)、`font`/`size` は ANSI の後に全域へ適用されるので
   `font=Menlo size=12` と併用できる。

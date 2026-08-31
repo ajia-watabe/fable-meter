@@ -44,12 +44,18 @@ COLOR_GRAY = "#8e8e93"
 
 # ドロップダウンの情報行は「色は付ける・クリックはさせない」。
 #
-# SwiftBar の MenuBarItem.configureAction() は
-#   if params.hasAction || params.color != nil { item.action = ... }
-# (SwiftBar/MenuBar/MenuBarItem.swift:1012-1013)なので、`color=` を付けた行は
-# それだけでクリック可能な項目になり、ホバーで選択ハイライトが出る。
+# SwiftBar v2.1.1 の buildMenuItem()/patchMenuItem() は
+#   let needsAction = params.hasAction || params.color != nil
+# (SwiftBar/MenuBar/MenuBarItem.swift:1518, :973)なので、`color=` を付けた行は
+# それだけでクリック可能な項目になる。
 # 一方 `ansi=true` は hasAction にも color にも影響しないので、
 # ANSI エスケープで色を付ければ「無効項目のまま色が付く」。
+#
+# 注意: macOS 26(Tahoe)では**無効項目でもホバーで紫のハイライトが描かれる**。
+# これは AppKit の描画で、色を一切付けていない行(予測:/取得:)でも同じように出る
+# (macOS 26.3 / SwiftBar 2.1.1 で全行を実測。Accessibility 上は enabled=false)。
+# プラグイン側でもSwiftBar のバージョンでも抑止できないため、
+# 「クリックは効かない・見た目のハイライトだけは出る」で確定。
 # atributedTitle() は ansi のとき params.color を上書きせず
 # (MenuBarItem.swift:1559-1566)、font/size は ansi でも最後に適用されるので
 # font=Menlo size=12 と併用できる。
