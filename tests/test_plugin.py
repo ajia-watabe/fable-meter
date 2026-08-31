@@ -127,21 +127,42 @@ class RenderTest(unittest.TestCase):
         # SwiftBar turns any row with color= into a clickable (highlightable)
         # menu item -- MenuBarItem.configureAction():
         #   if params.hasAction || params.color != nil { item.action = ... }
-        # State rows must stay actionless, so they carry no color at all.
+        # State rows must stay actionless, so colour comes from ansi=true
+        # instead, which configureAction() ignores.
         out = plugin.render(make_state(3, ok=False, error="token_expired"), NOW,
                             python_path="/p/python3", fetch_path="/r/fetch.py",
-                            history=[point(12, 6), point(0, 12)])
+                            history=[point(12, 6), point(0, 12)], dark=True)
         clickable = ("リフレッシュ", "使用量ページを開く", "ログを開く")
         info_rows = [ln for ln in out.split("\n")[2:]
                      if ln != "---" and not ln.startswith(clickable)]
         self.assertTrue(info_rows)
         for row in info_rows:
             self.assertNotIn("color=", row)
+            self.assertNotIn("href=", row)
+            self.assertNotIn("bash=", row)
+            self.assertNotIn("refresh=true", row)
         limit_rows = [ln for ln in info_rows
-                      if ln.startswith(("Fable", "週間(全モデル)", "セッション(5h)"))]
+                      if ln.startswith(plugin.ANSI_PRIMARY_DARK)]
         self.assertEqual(len(limit_rows), 3)
         for row in limit_rows:
+            self.assertIn("ansi=true", row)
             self.assertIn("font=Menlo size=12", row)
+
+    def test_limit_rows_are_uncoloured_in_light_appearance(self):
+        # The ANSI palette has no near-black chromatic colour, and a pure grey
+        # is swapped for the disabled tint by AppKit, so light mode keeps the
+        # default rendering.
+        out = plugin.render(make_state(3), NOW, dark=False)
+        rows = [ln for ln in out.split("\n") if ln.startswith("Fable")]
+        self.assertEqual(len(rows), 1)
+        self.assertNotIn(plugin.ESC, rows[0])
+        self.assertNotIn("ansi=true", rows[0])
+        self.assertIn("font=Menlo size=12", rows[0])
+
+    def test_appearance_comes_from_the_swiftbar_env_var(self):
+        self.assertTrue(plugin.is_dark_appearance({"OS_APPEARANCE": "Dark"}))
+        self.assertFalse(plugin.is_dark_appearance({"OS_APPEARANCE": "Light"}))
+        self.assertFalse(plugin.is_dark_appearance({}))
 
     def test_no_plan_row(self):
         out = plugin.render(make_state(3), NOW)
@@ -157,11 +178,20 @@ class RenderTest(unittest.TestCase):
         out = plugin.render(state, NOW)
         self.assertIn("\nまだデータがありません\n", out)
 
-    def test_error_row_is_marked_but_not_colored(self):
+    def test_error_row_is_red_via_ansi_and_stays_actionless(self):
         out = plugin.render(make_state(3, ok=False, error="token_expired"), NOW)
         row = [ln for ln in out.split("\n") if "エラー: token_expired" in ln][0]
-        self.assertTrue(row.startswith(plugin.ERROR_PREFIX))
+        self.assertTrue(row.startswith(plugin.ANSI_ERROR))
+        self.assertIn("ansi=true", row)
         self.assertNotIn("color=", row)
+        # ANSI 31 -> NSColor.systemRed, so the ⚠️ prefix is no longer needed.
+        self.assertNotIn("\u26a0", row)
+
+    def test_missing_state_error_row_is_red(self):
+        row = [ln for ln in plugin.render(None, NOW).split("\n")
+               if "state.json" in ln][0]
+        self.assertTrue(row.startswith(plugin.ANSI_ERROR))
+        self.assertIn("ansi=true", row)
 
     def test_missing_state_renders_error_row(self):
         out = plugin.render(None, NOW)

@@ -42,17 +42,57 @@ COLOR_WARN = "#e0a800"
 COLOR_CRIT = "#d0021b"
 COLOR_GRAY = "#8e8e93"
 
-# ドロップダウンの情報行には color= を**付けない**。
+# ドロップダウンの情報行は「色は付ける・クリックはさせない」。
+#
 # SwiftBar の MenuBarItem.configureAction() は
 #   if params.hasAction || params.color != nil { item.action = ... }
-# となっており(SwiftBar/MenuBar/MenuBarItem.swift)、color= を付けただけの行も
-# クリック可能な項目になってしまう(ホバーで選択ハイライトが出る)。
-# SwiftBar に disabled= 相当のパラメータは無いので、状態表示の行は
-#   「色を付けない = アクションを持たない = 無効項目」
-# として macOS 標準の淡色描画に任せる。ハイライトしないことを優先する。
-ERROR_PREFIX = "\u26a0\ufe0f "
+# (SwiftBar/MenuBar/MenuBarItem.swift:1012-1013)なので、`color=` を付けた行は
+# それだけでクリック可能な項目になり、ホバーで選択ハイライトが出る。
+# 一方 `ansi=true` は hasAction にも color にも影響しないので、
+# ANSI エスケープで色を付ければ「無効項目のまま色が付く」。
+# atributedTitle() は ansi のとき params.color を上書きせず
+# (MenuBarItem.swift:1559-1566)、font/size は ansi でも最後に適用されるので
+# font=Menlo size=12 と併用できる。
+#
+# 無効(action=nil)な NSMenuItem でも、attributedTitle に**有彩色**を入れておけば
+# AppKit はその色をそのまま描く。ただし r==g==b の**無彩色**(グレー・白・黒)は
+# AppKit が無効項目用の淡色に差し替えてしまう(実測: (188,188,188) は淡色化、
+# (188,188,190) はそのまま描画)。SwiftBar の ANSI 256 色のうち 232-255 の
+# グレースケール段は完全な無彩色なので、この用途には使えない。
+ESC = "\x1b"
+# 31 -> NSColor.systemRed(SwiftBar/Utility/String+ANSIColor.swift:9)。
+# 動的カラーなのでライト/ダーク双方で読める。
+ANSI_ERROR = ESC + "[31m"
+# 256 色番号 189 は SwiftBar の変換式で (247,248,255) になる。
+# ほぼ白だが無彩色ではないので無効項目でもそのまま描かれる = ダークでの本文色。
+# ライトには「黒に近い有彩色」が ANSI パレットに無いので、ライトでは色を付けない
+# (macOS 標準の無効項目描画に任せる)。
+ANSI_PRIMARY_DARK = ESC + "[38;5;189m"
+
+
+def is_dark_appearance(env=None):
+    """SwiftBar は OS_APPEARANCE=Dark/Light をプラグインに渡す。
+
+    (SwiftBar/Plugin/Plugin.swift:296, SwiftBar/Utility/Environment.swift:19)
+    テーマ切替でプラグインは再実行されず既存の出力を再描画するだけなので、
+    切り替え直後の最大10秒は前のテーマの色のままになる。
+    """
+    env = os.environ if env is None else env
+    return (env.get("OS_APPEARANCE") or "").strip().lower() == "dark"
+
+
+def ansi_row(text, code, params=""):
+    """色付き・アクション無しの行を作る。code が None なら素のまま。"""
+    tail = (" " + params).rstrip()
+    if not code:
+        return "%s |%s" % (text, tail) if tail else text
+    return "%s%s | ansi=true%s" % (code, text, tail)
+
 
 LABEL_WIDTH = 16
+
+# 等幅で桁を揃えるための共通パラメータ。
+MONO = "font=Menlo size=12"
 
 # ペース予測: 現在の窓に 2 点以上あり、その間隔が 3 時間以上あるときだけ出す。
 PROJECTION_MIN_POINTS = 2
@@ -326,7 +366,7 @@ def title_line(state, now=None):
 
 
 def render(state, now=None, python_path=None, fetch_path=None, log_path=LOG_PATH,
-           history=None):
+           history=None, dark=None):
     now = now or datetime.now(timezone.utc).astimezone()
     python_path = python_path or sys.executable or "/usr/bin/python3"
     fetch_path = fetch_path or default_fetch_path()
@@ -338,14 +378,17 @@ def render(state, now=None, python_path=None, fetch_path=None, log_path=LOG_PATH
         rows = (("Fable", data.get("fable")),
                 ("週間(全モデル)", data.get("seven_day")),
                 ("セッション(5h)", data.get("five_hour")))
+        if dark is None:
+            dark = is_dark_appearance()
+        primary = ANSI_PRIMARY_DARK if dark else None
         for label, entry in rows:
             if not isinstance(entry, dict):
-                lines.append("%s -- | font=Menlo size=12" % pad_label(label))
+                lines.append(ansi_row("%s --" % pad_label(label), primary, MONO))
                 continue
             reset = fmt_reset(entry.get("resets_at"), now)
-            lines.append(("%s %3s%%   %s" % (
+            text = ("%s %3s%%   %s" % (
                 pad_label(label), fmt_percent(entry.get("percent")), reset)).rstrip()
-                + " | font=Menlo size=12")
+            lines.append(ansi_row(text, primary, MONO))
         projection = projection_row(state, now, history)
         if projection:
             lines.append(projection)
@@ -362,12 +405,13 @@ def render(state, now=None, python_path=None, fetch_path=None, log_path=LOG_PATH
         lines.append("---")
 
     if not isinstance(state, dict):
-        lines.append("%sエラー: state.json が見つからないか読めません" % ERROR_PREFIX)
+        lines.append(ansi_row("エラー: state.json が見つからないか読めません",
+                              ANSI_ERROR))
     elif state.get("error"):
         at = parse_iso(state.get("error_at"))
         stamp = at.astimezone().strftime("%H:%M:%S") if at else "?"
-        lines.append("%sエラー: %s (%s)"
-                     % (ERROR_PREFIX, state.get("error"), stamp))
+        lines.append(ansi_row("エラー: %s (%s)" % (state.get("error"), stamp),
+                              ANSI_ERROR))
 
     lines.append("---")
     lines.append("リフレッシュ | bash=%s param1=%s param2=--force terminal=false "

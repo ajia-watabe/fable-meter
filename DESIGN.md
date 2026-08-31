@@ -188,11 +188,34 @@ claude-usage-tracker/          (GitHub: fable-meter)
 
 - ドロップダウンの状態表示行(3枠・予測・取得・エラー・データ無し)には **`color=` を付けない**。
   SwiftBar の `MenuBarItem.configureAction()` は
-  `if params.hasAction || params.color != nil { item.target = self; item.action = ... }` なので、
-  `color=` を付けただけの行もクリック可能な項目になり、ホバーで選択ハイライトが出る
-  (SwiftBar に `disabled=` 相当のパラメータは無い)。状態は状態として扱うため、
-  色より「選択できないこと」を優先し、macOS 標準の無効項目描画(淡色)に任せる。
-  エラー行の赤の代わりに、先頭に ⚠️ を付けて目立たせる。
+  `if params.hasAction || params.color != nil { item.target = self; item.action = ... }`
+  (`SwiftBar/MenuBar/MenuBarItem.swift:1012`)なので、`color=` を付けただけの行も
+  クリック可能な項目になり、ホバーで選択ハイライトが出る
+  (SwiftBar に `disabled=` 相当のパラメータは無い)。
+- 色は **`ansi=true` + ANSI エスケープ**で付ける。`ansi` は `hasAction` にも `color` にも
+  影響しないので、**色付き かつ アクション無し(=ハイライトしない)** が両立する。
+  `atributedTitle()` は `params.ansi` のとき `params.color` の上書きをせず
+  (`MenuBarItem.swift:1556-1566`)、`font`/`size` は ANSI の後に全域へ適用されるので
+  `font=Menlo size=12` と併用できる。
+- 使える色の制約(いずれも実測 + SwiftBar のソースで確認):
+  - 無効(`action == nil`)な `NSMenuItem` でも AppKit は**有彩色**の `attributedTitle` を
+    そのまま描く。ただし r==g==b の**無彩色**は無効項目用の淡色に差し替えられる
+    (実測: `(188,188,188)` は淡色化、`(188,188,190)` はそのまま)。
+    → ANSI 256 色のグレースケール段(232-255、`NSColor.colorForAnsi256ColorIndex`)は使えない。
+  - ANSI 24bit(`38;2;r;g;b`)は SwiftBar が未対応(`attributesForANSICodes` は `38;5;N` だけ)。
+  - 16 色は `NSColor.systemRed` などの動的カラーに落ちる(`String+ANSIColor.swift:3-21`)ので
+    ライト/ダーク自動。ただし `39` は「前景色を消す」に予約されていて `labelColor` は取れない。
+  - 256 色(16-231)の RGB 変換式は上流にバグがあり、実質「青寄りの派手な色」しか出ない。
+    その中で無彩色に近いのは 189 = `(247,248,255)`(ほぼ白)。
+- 実際の割り当て: 3 枠の行 = ダークのみ `\e[38;5;189m`(本文色相当)、ライトは無色
+  (ANSI に「黒に近い有彩色」が無いため)。`予測:` / `取得:` 行 = 無色(副次情報)。
+  エラー行 = `\e[31m`(`systemRed`)。赤が出るので ⚠️ プレフィクスは廃止。
+- ライト/ダークの判定は SwiftBar が渡す `OS_APPEARANCE`(`Plugin.swift:296`)。
+  テーマ切替時にプラグインは再実行されず既存出力を再描画するだけ
+  (`PluginManger.swift:352`)なので、切替直後は最大10秒だけ前のテーマの色が残る。
+- エスケープはリテラルの `\e` ではなく **実際の ESC バイト(0x1b)** を出す。
+  `atributedTitle()` は ANSI 変換の前に `unescape()`(`MenuBarItem.swift:1491`)を通し、
+  `\e` の backslash を落として `e[38;5;189m` にしてしまうため。
 - SwiftBar メタデータ(`<swiftbar.hideAbout>`, `<swiftbar.runInBash>false` 等)を先頭コメントに。SwiftBar 自身のサブメニュー行は `<swiftbar.hideSwiftBar>true</swiftbar.hideSwiftBar>` で隠す。
 - state.json を読む。無い/壊れている → `F-- W-- S--` と、ドロップダウンにエラー。
 - 鮮度 = `now - fetched_at`:
@@ -213,7 +236,7 @@ claude-usage-tracker/          (GitHub: fable-meter)
   予測: リセット時点 ~34%              ← 履歴が足りなければ「データ収集中(あと約2時間)」
   ---
   取得: 21:05:12 (3分前)
-  ⚠️ エラー: token_expired (21:10:00)  ← エラー時のみ
+  エラー: token_expired (21:10:00)     ← エラー時のみ(ANSI 赤)
   ---
   リフレッシュ      | bash=<abs python3> param1=<abs fetch.py> param2=--force terminal=false refresh=true sfimage=arrow.clockwise
   使用量ページを開く | href=https://claude.ai/settings/usage sfimage=safari
