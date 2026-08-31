@@ -116,9 +116,11 @@ class RenderTest(unittest.TestCase):
         self.assertIn("セッション(5h)", out)
         self.assertIn("プラン: max", out)
         self.assertIn("リセット", out)
-        self.assertIn("今すぐ更新 | bash=/p/python3 param1=/r/fetch.py "
-                      "param2=--force terminal=false refresh=true", out)
+        self.assertIn("リフレッシュ | bash=/p/python3 param1=/r/fetch.py "
+                      "param2=--force terminal=false refresh=true "
+                      "sfimage=arrow.clockwise", out)
         self.assertIn("ログを開く | bash=/usr/bin/open", out)
+        self.assertIn("sfimage=doc.text", out)
 
     def test_info_rows_have_explicit_colors(self):
         out = plugin.render(make_state(3), NOW, python_path="/p/python3",

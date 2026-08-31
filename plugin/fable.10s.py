@@ -225,9 +225,10 @@ def render(state, now=None, python_path=None, fetch_path=None, log_path=LOG_PATH
                      % (state.get("error"), stamp, COLOR_ERROR))
 
     lines.append("---")
-    lines.append("今すぐ更新 | bash=%s param1=%s param2=--force terminal=false refresh=true"
-                 % (python_path, fetch_path))
-    lines.append("ログを開く | bash=/usr/bin/open param1=%s terminal=false" % log_path)
+    lines.append("リフレッシュ | bash=%s param1=%s param2=--force terminal=false "
+                 "refresh=true sfimage=arrow.clockwise" % (python_path, fetch_path))
+    lines.append("ログを開く | bash=/usr/bin/open param1=%s terminal=false "
+                 "sfimage=doc.text" % log_path)
     return "\n".join(lines)
 
 

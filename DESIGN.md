@@ -174,8 +174,8 @@ claude-usage-tracker/          (GitHub: fable-meter)
   プラン: max · 取得: 21:05:12 (3分前)
   エラー: token_expired (21:10:00)     ← エラー時のみ、赤
   ---
-  今すぐ更新        | bash=<abs python3> param1=<abs fetch.py> param2=--force terminal=false refresh=true
-  ログを開く        | bash=open param1=~/.cache/fable-meter/fetch.log terminal=false
+  リフレッシュ      | bash=<abs python3> param1=<abs fetch.py> param2=--force terminal=false refresh=true sfimage=arrow.clockwise
+  ログを開く        | bash=open param1=~/.cache/fable-meter/fetch.log terminal=false sfimage=doc.text
   ```
 - リセット時刻は `astimezone()` でローカル時刻に変換して表示する。
 - 表示層は**ネットワークにも Keychain にもアクセスしない**。
@@ -213,7 +213,7 @@ uninstall.sh: bootout → plist 削除 → プラグイン削除 → キャッ�
 ## 8. テスト(`python3 -m unittest`)
 
 - `test_fetch.py`: fixture から `parse_usage()` が fable/seven_day/five_hour を正しく取り出す。`limits[]` から Fable を抜いた fixture → `fable_not_found`。`limits` 欠落 → `schema_error`。`percent` 非数値 → `schema_error`。state 書き出しがエラー時に前回の `data` を保持する。
-- `test_plugin.py`: 鮮度 0/11/31 分で `F12% W9% S6%` / `F12%? …` / `F-- …` になる。`ok=false` で `!`。80%/95% 超で色パラメータが付く。state.json 欠落で `--`。日本語ラベル・`リセット` / `今すぐ更新` / `ログを開く` が出る。
+- `test_plugin.py`: 鮮度 0/11/31 分で `F12% W9% S6%` / `F12%? …` / `F-- …` になる。`ok=false` で `!`。80%/95% 超で色パラメータが付く。state.json 欠落で `--`。日本語ラベル・`リセット` / `リフレッシュ` / `ログを開く` が出る。
 
 ## 9. 動作確認手順(実装後に必ず行う)
 
