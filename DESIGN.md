@@ -10,7 +10,7 @@
 | 取得層の言語 | Python 3(標準ライブラリのみ。`/opt/homebrew/bin/python3` 3.14) |
 | 表示層 | SwiftBar プラグイン(Python) |
 | トークン期限切れ時 | **自前更新しない**。エラー表示に留める(Claude Code の認証を壊すリスクをゼロにする) |
-| 通知 | なし。メニューバーの色変化のみ |
+| 通知 | Fable の 80% / 95% 到達時に macOS 通知を1回ずつ。ほかはメニューバーの色変化のみ |
 | メニューバー表示 | 短縮形 `F12% W9% S6%` |
 | 取得間隔 | 5分(launchd)+ ドロップダウンの `Refresh now` |
 | プロジェクト名 | `fable-meter`(キャッシュ `~/.cache/fable-meter/`、launchd ラベル `com.local.fable-meter`) |
@@ -68,12 +68,14 @@ launchd (5分ごと, RunAtLoad)
        ├─ Keychain からトークン取得(プロセス内メモリのみ)
        ├─ GET api.anthropic.com/api/oauth/usage
        ├─ limits[] をパース
-       └─ ~/.cache/fable-meter/state.json を atomic に書く → 終了
+       ├─ ~/.cache/fable-meter/state.json を atomic に書く
+       ├─ ~/.cache/fable-meter/history.jsonl に1行追記(8日より古い行は間引く)
+       └─ 80% / 95% を跨いだら osascript で通知 → 終了
 
 SwiftBar (10秒ごと)
   └─ ~/Library/Application Support/SwiftBar/Plugins/fable.10s.py
-       ├─ state.json を読む(ネットワークも Keychain も触らない)
-       └─ 1行 + ドロップダウンを stdout に出す → 終了
+       ├─ state.json と history.jsonl を読む(ネットワークも Keychain も触らない)
+       └─ 1行 + ドロップダウン(ペース予測を含む)を stdout に出す → 終了
 ```
 
 常駐するのは SwiftBar 本体のみ。取得層・表示層ともに「起動 → 即終了」。
@@ -102,7 +104,8 @@ claude-usage-tracker/          (GitHub: fable-meter)
 ### 入出力
 
 - 引数: `--dry-run`(state.json を書かず JSON を stdout へ)、`--verbose`(ログを stderr にも)、`--force`(スリープ復帰スキップを無視)
-- 出力: `~/.cache/fable-meter/state.json`(atomic: `state.json.tmp` に書いて `os.replace`)
+- 出力: `~/.cache/fable-meter/state.json`(atomic: `state.json.tmp` に書いて `os.replace`)、
+  `~/.cache/fable-meter/history.jsonl`(0600、追記)
 - ログ: `~/.cache/fable-meter/fetch.log`(200KB でローテート、1世代)
 - 終了コード: 0 成功 / 1 取得失敗(state.json はエラー状態で更新済み) / 2 引数エラー
 
@@ -123,6 +126,8 @@ claude-usage-tracker/          (GitHub: fable-meter)
    - `fable` ← `scoped` のうち `name == "Fable"`(大文字小文字無視)。**無ければ `fable_not_found` エラー。0% を捏造しない。**
    - `percent` が数値でない要素は `schema_error`。
 6. state.json 書き出し。
+7. history.jsonl に1行追記(§4.1)。
+8. 閾値通知の判定と発火(§4.2)。`--dry-run` では 6〜8 をいずれも行わない(副作用なし)。
 
 ### state.json スキーマ(schema 1)
 
@@ -139,9 +144,37 @@ claude-usage-tracker/          (GitHub: fable-meter)
     "five_hour": {"percent": 6,  "resets_at": "...", "severity": "normal"},
     "scoped":    [{"name": "Fable", "percent": 12, "resets_at": "...", "severity": "normal"}],
     "plan": "max"
-  }
+  },
+  "last_notified_band": 0
 }
 ```
+
+`last_notified_band` は閾値通知の状態(0 = 平常 / 1 = 80% 済 / 2 = 95% 済)。失敗時も直前の値を保持する。
+壊れた値(非 int、範囲外)は 0 として扱う。
+
+### history.jsonl(ペース予測用)
+
+`~/.cache/fable-meter/history.jsonl`(0600)。取得成功のたびに1行 JSON を**追記**する:
+
+```json
+{"t": "2026-08-29T21:05:12+00:00", "fable": 12, "seven_day": 9, "fable_resets_at": "2026-09-04T14:59:59+00:00"}
+```
+
+- `t` は UTC の ISO8601。`fable` / `seven_day` は整数パーセント(取れなければ `seven_day` は `null`)。
+- 書き込みのたびに 8 日より古い行を間引く。落ちる行があるときだけ `.tmp` + `os.replace` で書き直し、
+  通常は純粋な追記で済ませる。
+- 書き手は launchd の1プロセスのみ。手動リフレッシュと衝突しても最悪1行重複するだけで、
+  予測は重複に耐える(同一時刻の点が増えても傾きは変わらない)。
+
+### 4.2 閾値通知
+
+- バンド: `0` (<80%) / `1` (>=80%) / `2` (>=95%)。
+- 直前の `last_notified_band` と比較し、**増加したときだけ** 1 回通知する。
+- 週次リセットの検出(前回より Fable % が**減った**、または `resets_at` が **60 秒より大きく前進した**)で
+  バンドを 0 に戻す。60 秒の下限は API が返す `resets_at` の秒未満の揺れを誤検出しないため。
+- 発火は `/usr/bin/osascript -e 'display notification "..." with title "fable-meter"'`。
+  文字列に差し込むのは**整数パーセントのみ**(閾値と現在値)。ユーザー入力や API 文字列は一切入れない。
+- 失敗中(`ok=false`)の取得では通知しない(そもそも成功パスでしか呼ばない)。
 
 失敗時: `ok=false`、`error`(コード文字列)と `error_at` をセットし、**`data` と `fetched_at` は直前の成功値をそのまま保持する**。表示層はこの `fetched_at` で鮮度を判定する。一度も成功していなければ `data=null, fetched_at=null`。
 
@@ -170,13 +203,31 @@ claude-usage-tracker/          (GitHub: fable-meter)
   Fable             12%   リセット 9/4 23:59 (あと5日2時間)
   週間(全モデル)      9%   リセット 9/4 24:00 (あと5日3時間)
   セッション(5h)      6%   リセット 01:00 (あと3時間21分)
+  予測: リセット時点 ~34%              ← データが足りなければ行ごと出さない
   ---
   プラン: max · 取得: 21:05:12 (3分前)
   エラー: token_expired (21:10:00)     ← エラー時のみ、赤
   ---
   リフレッシュ      | bash=<abs python3> param1=<abs fetch.py> param2=--force terminal=false refresh=true sfimage=arrow.clockwise
+  使用量ページを開く | href=https://claude.ai/settings/usage sfimage=safari
   ログを開く        | bash=open param1=~/.cache/fable-meter/fetch.log terminal=false sfimage=doc.text
   ```
+
+### ペース予測(`予測:` 行)
+
+1. `history.jsonl` を読み、**現在の窓の点だけ**を取る。新しい順に遡り、`fable_resets_at` が
+   現在の `resets_at` と違う点、または(時系列で見て)% が下がる直前の点で打ち切る。
+   **`resets_at` はフェッチごとに秒未満が揺れる**(実測: `...15:00:00.051929` → `...15:00:00.487294`)ため、
+   文字列一致ではなく**分単位に丸めて**比較する。同じ理由で §4.2 のリセット判定も 60 秒以下の前進は無視する。
+   % の低下はリセットが起きた証拠なので、それより前は捨てる。
+2. 点が 2 個未満、最古と最新の間隔が 3 時間未満、`resets_at` が不明/過去 → **何も出さない**。
+3. 傾き `slope = (最新% - 最古%) / 間隔` を取り、`projected = 最新% + slope * (resets_at - 最新t)`。
+   `[最新%, 200]` にクランプする。
+4. `projected <= 100` → `予測: リセット時点 ~34%`。
+   `projected > 100`(かつ最新 % が 100 未満)→ 100% に到達する時刻を逆算して
+   `予測: 100%到達 9/3 15時ごろ`。最新 % が既に 100 以上なら到達時刻は出さず値だけ出す。
+5. `ok != true`、または鮮度 10 分以上のときは**出さない**(古い/失敗中の状態に基づく予測はしない)。
+6. 色は `COLOR_SECONDARY`。
 - リセット時刻は `astimezone()` でローカル時刻に変換して表示する。
 - 表示層は**ネットワークにも Keychain にもアクセスしない**。
 - 実行間隔はファイル名 `fable.10s.py` で固定。
@@ -208,12 +259,18 @@ install.sh(冪等):
 7. SwiftBar を起動(`open -a SwiftBar`)。
 8. 結果の確認方法を表示。
 
-uninstall.sh: bootout → plist 削除 → プラグイン削除 → キャッシュ削除は `--purge` 指定時のみ。
+uninstall.sh: bootout → plist 削除 → プラグイン削除 → キャッシュ削除は `--purge` 指定時のみ
+(`--purge` は `~/.cache/fable-meter/` ごと消すので `history.jsonl` も消える)。
 
 ## 8. テスト(`python3 -m unittest`)
 
 - `test_fetch.py`: fixture から `parse_usage()` が fable/seven_day/five_hour を正しく取り出す。`limits[]` から Fable を抜いた fixture → `fable_not_found`。`limits` 欠落 → `schema_error`。`percent` 非数値 → `schema_error`。state 書き出しがエラー時に前回の `data` を保持する。
-- `test_plugin.py`: 鮮度 0/11/31 分で `F12% W9% S6%` / `F12%? …` / `F-- …` になる。`ok=false` で `!`。80%/95% 超で色パラメータが付く。state.json 欠落で `--`。日本語ラベル・`リセット` / `リフレッシュ` / `ログを開く` が出る。
+- `test_fetch.py`(追加): history のレコード生成・8日プルーニング・0600 追記、
+  バンド判定(80/95 の跨ぎで1回だけ、% 低下や `resets_at` 前進でバンドが 0 に戻る、壊れた値は 0)、
+  通知文字列に整数以外が入らないこと。
+- `test_plugin.py`: 鮮度 0/11/31 分で `F12% W9% S6%` / `F12%? …` / `F-- …` になる。`ok=false` で `!`。80%/95% 超で色パラメータが付く。state.json 欠落で `--`。日本語ラベル・`リセット` / `リフレッシュ` / `使用量ページを開く` / `ログを開く` が出る。
+- `test_plugin.py`(予測): 通常の線形予測、窓の跨ぎ(リセットを挟むと古い点を捨てる)、
+  データ不足で行が出ない、100% 超で到達時刻に切り替わる、失敗中/古い state では出さない。
 
 ## 9. 動作確認手順(実装後に必ず行う)
 
@@ -233,4 +290,5 @@ uninstall.sh: bootout → plist 削除 → プラグイン削除 → キャッ�
 | Keychain「常に許可」 | `security` コマンドに対する許可。元々 Keychain にある情報なので新規リスクは小さい |
 | 非公開 API の変更 | `schema_error` / `fable_not_found` を握り潰さず `!` を出す |
 | launchd の PATH | plist に PATH を明示、python3 は絶対パス |
-| 9/1 プロモ終了 | 同じ作業量で % が跳ねる。異常ではない |
+| 9/1 プロモ終了 | 同じ作業量で % が跳ねる。異常ではない。跳ねた結果 80%/95% を跨ぐと通知が出ることがある |
+| 予測の外れ | 直線外挿にすぎない。データ不足なら出さない・失敗中や古い state では出さないことで「それらしい嘘」を避ける |

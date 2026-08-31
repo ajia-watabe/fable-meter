@@ -16,11 +16,13 @@ import json
 import os
 import sys
 import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "fable-meter")
 STATE_PATH = os.path.join(CACHE_DIR, "state.json")
 LOG_PATH = os.path.join(CACHE_DIR, "fetch.log")
+HISTORY_PATH = os.path.join(CACHE_DIR, "history.jsonl")
+USAGE_PAGE_URL = "https://claude.ai/settings/usage"
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # install.sh がプラグインをコピーする際、この行を絶対パスに書き換える。
 FETCH_PATH = ""
@@ -44,6 +46,12 @@ COLOR_INFO = "#1d1d1f,#e8e8ed"
 COLOR_SECONDARY = "#6e6e73,#98989d"
 
 LABEL_WIDTH = 16
+
+# ペース予測: 現在の窓に 2 点以上あり、その間隔が 3 時間以上あるときだけ出す。
+PROJECTION_MIN_POINTS = 2
+PROJECTION_MIN_SPAN_SECONDS = 3 * 3600
+PROJECTION_MAX_PERCENT = 200
+HISTORY_MAX_LINES = 4000
 
 
 def read_state(path=STATE_PATH):
@@ -124,6 +132,129 @@ def fmt_reset(text, now):
     return "リセット %s (あと%s)" % (stamp, fmt_duration(delta))
 
 
+def read_history(path=HISTORY_PATH, max_lines=HISTORY_MAX_LINES):
+    """Return history records oldest-first. Unreadable file -> []."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except (OSError, ValueError):
+        return []
+    entries = []
+    for line in lines[-max_lines:]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        stamp = parse_iso(entry.get("t"))
+        percent = entry.get("fable")
+        if stamp is None or isinstance(percent, bool) \
+                or not isinstance(percent, (int, float)):
+            continue
+        entries.append({
+            "t": stamp,
+            "fable": float(percent),
+            "fable_resets_at": entry.get("fable_resets_at"),
+        })
+    entries.sort(key=lambda e: e["t"])
+    return entries
+
+
+def reset_key(text):
+    """Normalize a resets_at string for comparison.
+
+    The API jitters the sub-second part of resets_at on every fetch, so string
+    equality would make every sample look like its own window. Compare at
+    minute granularity instead.
+    """
+    dt = parse_iso(text)
+    if dt is None:
+        return None
+    return int(dt.timestamp() // 60)
+
+
+def window_points(entries, resets_at):
+    """Keep only the points belonging to the current window.
+
+    Walking backwards from the newest point, stop at the first entry whose
+    resets_at differs from the current one, or whose percent is *higher* than
+    the point after it -- going forward that is a drop, i.e. a weekly reset.
+    """
+    points = []
+    newer_percent = None
+    target = reset_key(resets_at)
+    for entry in reversed(entries or []):
+        entry_key = reset_key(entry.get("fable_resets_at"))
+        if target is not None and entry_key is not None and entry_key != target:
+            break
+        if newer_percent is not None and entry["fable"] > newer_percent:
+            break
+        points.append(entry)
+        newer_percent = entry["fable"]
+    points.reverse()
+    return points
+
+
+def project(points, resets_at, now=None):
+    """Linear pace projection for the current window.
+
+    Returns None (not enough data), ("reset", percent) for the value expected at
+    the reset, or ("cross", datetime) for when 100% is expected to be reached.
+    """
+    if len(points) < PROJECTION_MIN_POINTS or resets_at is None:
+        return None
+    first, last = points[0], points[-1]
+    span = (last["t"] - first["t"]).total_seconds()
+    if span < PROJECTION_MIN_SPAN_SECONDS:
+        return None
+    remaining = (resets_at - last["t"]).total_seconds()
+    if remaining <= 0:
+        return None
+    slope = (last["fable"] - first["fable"]) / span
+    projected = last["fable"] + slope * remaining
+    projected = max(last["fable"], min(PROJECTION_MAX_PERCENT, projected))
+    # Already past 100%: there is no future crossing to report, just the value.
+    if projected > 100 and slope > 0 and last["fable"] < 100:
+        cross = last["t"] + timedelta(seconds=(100.0 - last["fable"]) / slope)
+        return ("cross", cross)
+    return ("reset", projected)
+
+
+def projection_row(state, now, history=None):
+    """The 予測 line, or None when the data does not support one."""
+    if not isinstance(state, dict) or state.get("ok") is not True:
+        return None
+    age = age_seconds(state, now)
+    if age is None or age >= STALE_SECONDS:
+        return None
+    data = state.get("data")
+    if not isinstance(data, dict):
+        return None
+    fable = data.get("fable")
+    if not isinstance(fable, dict):
+        return None
+    resets_at_text = fable.get("resets_at")
+    resets_at = parse_iso(resets_at_text)
+    if resets_at is None:
+        return None
+    if history is None:
+        history = read_history()
+    result = project(window_points(history, resets_at_text), resets_at, now)
+    if result is None:
+        return None
+    kind, value = result
+    if kind == "cross":
+        local = value.astimezone()
+        text = "予測: 100%%到達 %sごろ" % local.strftime("%-m/%-d %-H時")
+    else:
+        text = "予測: リセット時点 ~%d%%" % int(round(value))
+    return "%s | color=%s" % (text, COLOR_SECONDARY)
+
+
 def build_title(state, now):
     """Return (title_line, is_degraded)."""
     data = (state or {}).get("data") if isinstance(state, dict) else None
@@ -179,7 +310,8 @@ def title_line(state, now=None):
     return title
 
 
-def render(state, now=None, python_path=None, fetch_path=None, log_path=LOG_PATH):
+def render(state, now=None, python_path=None, fetch_path=None, log_path=LOG_PATH,
+           history=None):
     now = now or datetime.now(timezone.utc).astimezone()
     python_path = python_path or sys.executable or "/usr/bin/python3"
     fetch_path = fetch_path or default_fetch_path()
@@ -200,6 +332,9 @@ def render(state, now=None, python_path=None, fetch_path=None, log_path=LOG_PATH
             lines.append(("%s %3s%%   %s" % (
                 pad_label(label), fmt_percent(entry.get("percent")), reset)).rstrip()
                 + " | font=Menlo size=12 color=%s" % COLOR_INFO)
+        projection = projection_row(state, now, history)
+        if projection:
+            lines.append(projection)
         lines.append("---")
         plan = data.get("plan") or "-"
         age = age_seconds(state, now)
@@ -227,6 +362,7 @@ def render(state, now=None, python_path=None, fetch_path=None, log_path=LOG_PATH
     lines.append("---")
     lines.append("リフレッシュ | bash=%s param1=%s param2=--force terminal=false "
                  "refresh=true sfimage=arrow.clockwise" % (python_path, fetch_path))
+    lines.append("使用量ページを開く | href=%s sfimage=safari" % USAGE_PAGE_URL)
     lines.append("ログを開く | bash=/usr/bin/open param1=%s terminal=false "
                  "sfimage=doc.text" % log_path)
     return "\n".join(lines)

@@ -25,12 +25,20 @@ KEYCHAIN_SERVICE = "Claude Code-credentials"
 # Absolute paths only: never resolve helper binaries through $PATH.
 SECURITY_BIN = "/usr/bin/security"
 SYSCTL_BIN = "/usr/sbin/sysctl"
+OSASCRIPT_BIN = "/usr/bin/osascript"
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "fable-meter")
 STATE_PATH = os.path.join(CACHE_DIR, "state.json")
 LOG_PATH = os.path.join(CACHE_DIR, "fetch.log")
+HISTORY_PATH = os.path.join(CACHE_DIR, "history.jsonl")
 LOG_MAX_BYTES = 200 * 1024
 HTTP_TIMEOUT = 15
 WAKE_SKIP_SECONDS = 60
+HISTORY_MAX_DAYS = 8
+# 閾値通知のバンド: 0 = 平常, 1 = 80% 以上, 2 = 95% 以上。
+NOTIFY_THRESHOLDS = ((2, 95), (1, 80))
+NOTIFY_TITLE = "fable-meter"
+# resets_at はフェッチごとに秒未満が揺れるので、この秒数以下の前進は無視する。
+RESET_JITTER_SECONDS = 60
 
 
 class FetchError(Exception):
@@ -306,6 +314,172 @@ def parse_usage(payload, plan=None):
     }
 
 
+# ---------------------------------------------------------------------- history
+
+def _iso_now(now=None):
+    return (now or datetime.now(timezone.utc).astimezone()).isoformat()
+
+
+def parse_iso(text):
+    """ISO8601 -> aware datetime, or None. Naive strings are treated as UTC."""
+    if not isinstance(text, str) or not text:
+        return None
+    value = text.strip()
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def history_entry(data, now=None):
+    """Build one history record from a parsed `data` object, or None."""
+    if not isinstance(data, dict):
+        return None
+    fable = data.get("fable") or {}
+    percent = fable.get("percent")
+    if isinstance(percent, bool) or not isinstance(percent, (int, float)):
+        return None
+    seven = data.get("seven_day") or {}
+    seven_percent = seven.get("percent")
+    if isinstance(seven_percent, bool) or not isinstance(seven_percent, (int, float)):
+        seven_percent = None
+    else:
+        seven_percent = int(round(seven_percent))
+    return {
+        "t": (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat(),
+        "fable": int(round(percent)),
+        "seven_day": seven_percent,
+        "fable_resets_at": fable.get("resets_at"),
+    }
+
+
+def prune_history_lines(lines, now=None, max_days=HISTORY_MAX_DAYS):
+    """Drop lines whose `t` is older than max_days (or unparseable)."""
+    now = now or datetime.now(timezone.utc)
+    cutoff = now.timestamp() - max_days * 86400
+    kept = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        stamp = parse_iso(entry.get("t"))
+        if stamp is None or stamp.timestamp() < cutoff:
+            continue
+        kept.append(line)
+    return kept
+
+
+def append_history(data, now=None, path=HISTORY_PATH):
+    """Append one 0600 JSONL line, pruning entries older than HISTORY_MAX_DAYS.
+
+    A single launchd writer means a plain append is enough; a concurrent manual
+    refresh can at worst duplicate a line, which the projection tolerates.
+    """
+    entry = history_entry(data, now=now)
+    if entry is None:
+        return None
+    directory = os.path.dirname(path)
+    if directory:
+        _ensure_private_dir(directory)
+    line = json.dumps(entry, ensure_ascii=False)
+    with _open_private(path, "a") as fh:
+        fh.write(line + "\n")
+    # Prune only when something actually fell out of the window, so the common
+    # case stays a pure append.
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return entry
+    kept = prune_history_lines(lines, now=now)
+    if len(kept) != len(lines):
+        tmp = path + ".tmp"
+        with _open_private(tmp, "w") as fh:
+            fh.write("\n".join(kept) + ("\n" if kept else ""))
+        os.replace(tmp, path)
+    return entry
+
+
+# ----------------------------------------------------------------- notification
+
+def band_for_percent(percent):
+    """0 (<80), 1 (>=80), 2 (>=95). Non-numeric -> 0."""
+    if isinstance(percent, bool) or not isinstance(percent, (int, float)):
+        return 0
+    for band, threshold in NOTIFY_THRESHOLDS:
+        if percent >= threshold:
+            return band
+    return 0
+
+
+def stored_band(state):
+    band = (state or {}).get("last_notified_band") if isinstance(state, dict) else None
+    if isinstance(band, bool) or not isinstance(band, int):
+        return 0
+    return band if 0 <= band <= 2 else 0
+
+
+def window_reset(previous_state, fable):
+    """True if the weekly window rolled over since the previous state."""
+    previous = (previous_state or {}).get("data") if isinstance(previous_state, dict) else None
+    previous = (previous or {}).get("fable") if isinstance(previous, dict) else None
+    if not isinstance(previous, dict) or not isinstance(fable, dict):
+        return False
+    old_pct, new_pct = previous.get("percent"), fable.get("percent")
+    if not isinstance(old_pct, bool) and isinstance(old_pct, (int, float)) \
+            and not isinstance(new_pct, bool) and isinstance(new_pct, (int, float)) \
+            and new_pct < old_pct:
+        return True
+    old_reset = parse_iso(previous.get("resets_at"))
+    new_reset = parse_iso(fable.get("resets_at"))
+    # The API jitters resets_at by fractions of a second between fetches, so
+    # only a move of at least RESET_JITTER_SECONDS counts as a new window.
+    if old_reset is not None and new_reset is not None \
+            and (new_reset - old_reset).total_seconds() > RESET_JITTER_SECONDS:
+        return True
+    return False
+
+
+def evaluate_band(previous_state, fable):
+    """Return (band_to_store, percent_to_notify_or_None).
+
+    Fires at most once per band per window; a detected reset clears the band.
+    """
+    current = band_for_percent((fable or {}).get("percent"))
+    last = 0 if window_reset(previous_state, fable) else stored_band(previous_state)
+    if current > last:
+        return current, int(round(fable["percent"]))
+    return max(last, current), None
+
+
+def notify(band, percent, verbose=False):
+    """Fire a macOS notification. Only the integer percent is interpolated."""
+    threshold = dict((b, t) for b, t in NOTIFY_THRESHOLDS).get(band)
+    if threshold is None:
+        return False
+    script = 'display notification "Fable が%d%%を超えました(現在 %d%%)" with title "%s"' % (
+        threshold, int(percent), NOTIFY_TITLE)
+    try:
+        subprocess.run([OSASCRIPT_BIN, "-e", script],
+                       capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        log("notify_failed band=%d" % band, verbose)
+        return False
+    log("notified band=%d" % band, verbose)
+    return True
+
+
 # ------------------------------------------------------------------------ state
 
 def load_state(path=STATE_PATH):
@@ -319,7 +493,7 @@ def load_state(path=STATE_PATH):
     return state
 
 
-def build_success_state(data, now=None):
+def build_success_state(data, now=None, last_notified_band=0):
     now = now or datetime.now(timezone.utc).astimezone()
     return {
         "schema": SCHEMA,
@@ -328,6 +502,7 @@ def build_success_state(data, now=None):
         "error": None,
         "error_at": None,
         "data": data,
+        "last_notified_band": stored_band({"last_notified_band": last_notified_band}),
     }
 
 
@@ -342,6 +517,7 @@ def build_error_state(code, previous=None, now=None):
         "error": code,
         "error_at": now.isoformat(),
         "data": previous.get("data"),
+        "last_notified_band": stored_band(previous),
     }
 
 
@@ -387,17 +563,25 @@ def run(dry_run=False, verbose=False, force=False):
                 log("error=state_write_failed", verbose)
         return 1
 
-    state = build_success_state(data)
+    band, notify_percent = evaluate_band(previous, data["fable"])
+    state = build_success_state(data, last_notified_band=band)
     log("ok fable=%s weekly=%s session=%s" % (
         data["fable"]["percent"],
         data["seven_day"]["percent"] if data["seven_day"] else None,
         data["five_hour"]["percent"] if data["five_hour"] else None,
     ), verbose)
     if dry_run:
+        # --dry-run has no side effects: no state, no history, no notification.
         json.dump(state, sys.stdout, ensure_ascii=False, indent=2)
         sys.stdout.write("\n")
-    else:
-        write_state(state)
+        return 0
+    write_state(state)
+    try:
+        append_history(data)
+    except OSError:
+        log("error=history_write_failed", verbose)
+    if notify_percent is not None:
+        notify(band, notify_percent, verbose)
     return 0
 
 
