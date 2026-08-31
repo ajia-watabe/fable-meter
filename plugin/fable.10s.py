@@ -223,11 +223,17 @@ def reset_key(text):
     The API jitters the sub-second part of resets_at on every fetch, so string
     equality would make every sample look like its own window. Compare at
     minute granularity instead.
+
+    That jitter straddles a minute boundary: the same window has been observed
+    as both `2026-09-04T15:00:00.051929` and `2026-09-04T14:59:59.579336`.
+    Flooring would put those in different minutes (15:00 vs 14:59) and cut the
+    window on nearly every fetch, so round to the *nearest* minute. Observed
+    jitter is well under a second, so a 30s tolerance on each side is ample.
     """
     dt = parse_iso(text)
     if dt is None:
         return None
-    return int(dt.timestamp() // 60)
+    return int((dt.timestamp() + 30) // 60)
 
 
 def window_points(entries, resets_at):
@@ -277,12 +283,27 @@ def project(points, resets_at, now=None):
     return ("reset", projected)
 
 
-def collecting_hours(points, now):
-    """Hours left until the current window spans enough time to project."""
+COLLECTING_MINUTES_BELOW_SECONDS = 90 * 60
+COLLECTING_MINUTE_STEP = 10
+
+
+def collecting_label(points, now):
+    """「あと約N時間」/「あと約N分」: time left until the window can be projected.
+
+    Hours are too coarse near the end -- the countdown would sit on 「約1時間」
+    for a whole hour -- so switch to 10-minute steps below 90 minutes.
+    """
     if not points:
-        return int(math.ceil(PROJECTION_MIN_SPAN_SECONDS / 3600.0))
-    remaining = PROJECTION_MIN_SPAN_SECONDS - (now - points[0]["t"]).total_seconds()
-    return max(1, int(math.ceil(remaining / 3600.0)))
+        remaining = PROJECTION_MIN_SPAN_SECONDS
+    else:
+        remaining = PROJECTION_MIN_SPAN_SECONDS \
+            - (now - points[0]["t"]).total_seconds()
+    if remaining >= COLLECTING_MINUTES_BELOW_SECONDS:
+        return "あと約%d時間" % int(math.ceil(remaining / 3600.0))
+    minutes = int(math.ceil(max(0.0, remaining) / 60.0))
+    step = COLLECTING_MINUTE_STEP
+    minutes = max(step, int(math.ceil(minutes / float(step))) * step)
+    return "あと約%d分" % minutes
 
 
 def projection_row(state, now, history=None):
@@ -308,7 +329,7 @@ def projection_row(state, now, history=None):
     result = project(points, resets_at, now)
     if result is None:
         # 状態は新しいのに履歴が足りないだけ: 収集中であることを出す。
-        return "予測: データ収集中(あと約%d時間)" % collecting_hours(points, now)
+        return "予測: データ収集中(%s)" % collecting_label(points, now)
     kind, value = result
     if kind == "cross":
         local = value.astimezone()

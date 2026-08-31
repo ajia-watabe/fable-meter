@@ -300,6 +300,19 @@ class WindowPointsTest(unittest.TestCase):
         self.assertEqual(plugin.window_points(pts, RESETS_AT), pts)
         self.assertEqual(plugin.reset_key("2026-09-04T14:59:59.9+00:00"),
                          plugin.reset_key(RESETS_AT))
+
+    def test_jitter_across_a_minute_boundary_keeps_one_window(self):
+        # Real history.jsonl values: the same window is reported both just
+        # before and just after 15:00, so flooring to the minute would split it.
+        before = "2026-09-04T14:59:59.579336+00:00"
+        after = "2026-09-04T15:00:00.051929+00:00"
+        self.assertEqual(plugin.reset_key(before), plugin.reset_key(after))
+        pts = [point(12, 4, resets_at=after), point(6, 8, resets_at=before),
+               point(0, 12, resets_at=after)]
+        self.assertEqual(plugin.window_points(pts, before), pts)
+        self.assertEqual(plugin.window_points(pts, after), pts)
+
+    def test_reset_key_of_an_unparseable_value(self):
         self.assertIsNone(plugin.reset_key(None))
         self.assertIsNone(plugin.reset_key("nope"))
 
@@ -347,21 +360,42 @@ class ProjectionRowTest(unittest.TestCase):
                                     [point(70 / 60.0, 10), point(0, 12)])
         self.assertEqual(row, "予測: データ収集中(あと約2時間)")
 
-    def test_collecting_row_never_drops_below_one_hour(self):
+    def test_collecting_row_never_drops_below_ten_minutes(self):
         # A single 5h-old point cannot span anything yet, but the next fetch can.
         self.assertEqual(plugin.projection_row(make_state(0), NOW,
                                                [point(5, 10)]),
-                         "予測: データ収集中(あと約1時間)")
+                         "予測: データ収集中(あと約10分)")
 
     def test_collecting_row_ignores_points_of_the_previous_window(self):
         old = point(30, 90, resets_at="2026-08-28T14:59:59+00:00")
         row = plugin.projection_row(make_state(0), NOW, [old, point(1, 12)])
         self.assertEqual(row, "予測: データ収集中(あと約2時間)")
 
-    def test_collecting_hours_helper(self):
-        self.assertEqual(plugin.collecting_hours([], NOW), 3)
-        self.assertEqual(plugin.collecting_hours([point(0, 1)], NOW), 3)
-        self.assertEqual(plugin.collecting_hours([point(2.5, 1)], NOW), 1)
+    def test_collecting_label_helper(self):
+        self.assertEqual(plugin.collecting_label([], NOW), "あと約3時間")
+        self.assertEqual(plugin.collecting_label([point(0, 1)], NOW), "あと約3時間")
+
+    def test_collecting_label_uses_hours_at_or_above_90_minutes(self):
+        # 2.1h left -> ceil to 3h, as before.
+        self.assertEqual(plugin.collecting_label([point(0.9, 1)], NOW),
+                         "あと約3時間")
+        # Exactly 90 minutes is still an hours label.
+        self.assertEqual(plugin.collecting_label([point(1.5, 1)], NOW),
+                         "あと約2時間")
+
+    def test_collecting_label_uses_ten_minute_steps_below_90_minutes(self):
+        # 80 minutes left -> 約80分.
+        self.assertEqual(plugin.collecting_label([point(100 / 60.0, 1)], NOW),
+                         "あと約80分")
+        # 5 minutes left -> floored at the 10-minute step.
+        self.assertEqual(plugin.collecting_label([point(175 / 60.0, 1)], NOW),
+                         "あと約10分")
+        # Already past the span (single old point) -> still 約10分.
+        self.assertEqual(plugin.collecting_label([point(9, 1)], NOW),
+                         "あと約10分")
+        # 61 minutes left rounds up to the next 10-minute step.
+        self.assertEqual(plugin.collecting_label([point(119 / 60.0, 1)], NOW),
+                         "あと約70分")
 
     def test_no_row_when_stale(self):
         self.assertIsNone(plugin.projection_row(make_state(11), NOW,
