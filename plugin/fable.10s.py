@@ -20,6 +20,9 @@ import unicodedata
 from datetime import datetime, timedelta, timezone
 
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "fable-meter")
+# 設定はキャッシュではないので ~/.config に置く(uninstall.sh --purge で消えない)。
+CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".config", "fable-meter")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 STATE_PATH = os.path.join(CACHE_DIR, "state.json")
 LOG_PATH = os.path.join(CACHE_DIR, "fetch.log")
 HISTORY_PATH = os.path.join(CACHE_DIR, "history.jsonl")
@@ -52,7 +55,7 @@ COLOR_GRAY = "#8e8e93"
 # ANSI エスケープで色を付ければ「無効項目のまま色が付く」。
 #
 # 注意: macOS 26(Tahoe)では**無効項目でもホバーで紫のハイライトが描かれる**。
-# これは AppKit の描画で、色を一切付けていない行(予測:/取得:)でも同じように出る
+# これは AppKit の描画で、色を一切付けていない行(取得:)でも同じように出る
 # (macOS 26.3 / SwiftBar 2.1.1 で全行を実測。Accessibility 上は enabled=false)。
 # プラグイン側でもSwiftBar のバージョンでも抑止できないため、
 # 「クリックは効かない・見た目のハイライトだけは出る」で確定。
@@ -95,7 +98,107 @@ def ansi_row(text, code, params=""):
     return "%s%s | ansi=true%s" % (code, text, tail)
 
 
+# 等幅で桁を揃えるためのラベル幅(表示セル数)。日本語は全角ラベルが 14 セル、
+# 英語は "Weekly (all models)" が 19 セルなので言語ごとに変える。
 LABEL_WIDTH = 16
+LABEL_WIDTH_EN = 21
+LABEL_WIDTHS = {"ja": LABEL_WIDTH, "en": LABEL_WIDTH_EN}
+
+# 既定の言語。実際の言語は resolve_lang()(config.json + state.locale_lang)で決まり、
+# main() だけが解決する。ここは「引数を省いたときの言語」= このツールの原語。
+DEFAULT_LANG = "ja"
+LANGS = ("ja", "en")
+
+# ユーザーに見える文字列は全てここに置く。書式指定子の数と並びは両言語で同じ。
+STRINGS = {
+    "ja": {
+        "label_fable": "Fable",
+        "label_weekly": "週間(全モデル)",
+        "label_session": "セッション(5h)",
+        "proj_fable": "予測 Fable",
+        "proj_weekly": "予測 週間",
+        "proj_prefix": "予測",
+        "reset": "リセット %s",
+        "reset_left": "リセット %s (あと%s)",
+        "date_reset": "%-m/%-d %H:%M",
+        "dur_days": "%d日%d時間",
+        "dur_hours": "%d時間%d分",
+        "dur_minutes": "%d分",
+        "at_reset": "リセット時点 ~%d%%",
+        "cross": "100%%到達 %sごろ",
+        "date_cross": "%-m/%-d %-H時",
+        "collecting": "データ収集中(%s)",
+        "collecting_hours": "あと約%d時間",
+        "collecting_minutes": "あと約%d分",
+        "fetched": "取得: %s (%s前)",
+        "fetched_none": "取得: なし",
+        "error": "エラー: %s (%s)",
+        "error_no_state": "エラー: state.json が見つからないか読めません",
+        "no_data": "まだデータがありません",
+        "refresh": "リフレッシュ",
+        "open_usage": "使用量ページを開く",
+        "open_log": "ログを開く",
+    },
+    "en": {
+        "label_fable": "Fable",
+        "label_weekly": "Weekly (all models)",
+        "label_session": "Session (5h)",
+        "proj_fable": "Forecast Fable",
+        "proj_weekly": "Forecast Weekly",
+        "proj_prefix": "Forecast",
+        "reset": "resets %s",
+        "reset_left": "resets %s (%s left)",
+        "date_reset": "%b %-d %H:%M",
+        "dur_days": "%dd %dh",
+        "dur_hours": "%dh %dm",
+        "dur_minutes": "%dm",
+        "at_reset": "~%d%% at reset",
+        "cross": "hits 100%% ~%s",
+        "date_cross": "%b %-d, %-I%p",
+        "collecting": "collecting data (%s)",
+        "collecting_hours": "~%dh left",
+        "collecting_minutes": "~%dm left",
+        "fetched": "fetched: %s (%s ago)",
+        "fetched_none": "fetched: none",
+        "error": "Error: %s (%s)",
+        "error_no_state": "Error: state.json is missing or unreadable",
+        "no_data": "No data yet",
+        "refresh": "Refresh",
+        "open_usage": "Open usage page",
+        "open_log": "Open log",
+    },
+}
+
+
+def strings(lang=DEFAULT_LANG):
+    return STRINGS.get(lang) or STRINGS[DEFAULT_LANG]
+
+
+def read_config(path=CONFIG_PATH):
+    """~/.config/fable-meter/config.json。無い/壊れている → {}(既定に落ちる)。"""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            config = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return config if isinstance(config, dict) else {}
+
+
+def resolve_lang(config=None, state=None):
+    """明示指定 > state の locale_lang(fetch.py が解決したシステムロケール)> en。
+
+    config.json は表示層が毎回読む(ローカルの小さな JSON なので十分速い)。
+    "auto" のときのシステムロケール解決は取得層に任せる: SwiftBar の環境には
+    LANG が無いことが多く、プラグインからは判定できないため。
+    """
+    value = (config or {}).get("lang")
+    if isinstance(value, str) and value.strip().lower() in LANGS:
+        return value.strip().lower()
+    stored = (state or {}).get("locale_lang") if isinstance(state, dict) else None
+    if isinstance(stored, str) and stored.strip().lower() in LANGS:
+        return stored.strip().lower()
+    return "en"
+
 
 # 等幅で桁を揃えるための共通パラメータ。
 MONO = "font=Menlo size=12"
@@ -160,16 +263,17 @@ def fmt_percent(value):
     return str(int(round(value)))
 
 
-def fmt_duration(seconds):
+def fmt_duration(seconds, lang=DEFAULT_LANG):
+    text = strings(lang)
     seconds = int(max(0, seconds))
     days, rem = divmod(seconds, 86400)
     hours, rem = divmod(rem, 3600)
     minutes = rem // 60
     if days:
-        return "%d日%d時間" % (days, hours)
+        return text["dur_days"] % (days, hours)
     if hours:
-        return "%d時間%d分" % (hours, minutes)
-    return "%d分" % minutes
+        return text["dur_hours"] % (hours, minutes)
+    return text["dur_minutes"] % minutes
 
 
 def display_width(text):
@@ -180,23 +284,26 @@ def display_width(text):
     return width
 
 
-def pad_label(text, width=LABEL_WIDTH):
+def pad_label(text, width=None, lang=DEFAULT_LANG):
+    if width is None:
+        width = LABEL_WIDTHS.get(lang, LABEL_WIDTH)
     return text + " " * max(0, width - display_width(text))
 
 
-def fmt_reset(text, now):
+def fmt_reset(text, now, lang=DEFAULT_LANG):
+    labels = strings(lang)
     dt = parse_iso(text)
     if dt is None:
         return ""
     local = dt.astimezone()
     delta = (dt - now).total_seconds()
     if delta >= 86400:
-        stamp = local.strftime("%-m/%-d %H:%M")
+        stamp = local.strftime(labels["date_reset"])
     else:
         stamp = local.strftime("%H:%M")
     if delta <= 0:
-        return "リセット %s" % stamp
-    return "リセット %s (あと%s)" % (stamp, fmt_duration(delta))
+        return labels["reset"] % stamp
+    return labels["reset_left"] % (stamp, fmt_duration(delta, lang))
 
 
 def read_history(path=HISTORY_PATH, max_lines=HISTORY_MAX_LINES):
@@ -256,8 +363,8 @@ def reset_key(text):
     return int((dt.timestamp() + 30) // 60)
 
 
-# 予測を出す指標。history.jsonl の値のキーと、行に出すラベル。
-PROJECTION_METRICS = (("fable", "Fable"), ("seven_day", "週間"))
+# 予測を出す指標。history.jsonl の値のキーと、行のラベルの STRINGS キー。
+PROJECTION_METRICS = (("fable", "proj_fable"), ("seven_day", "proj_weekly"))
 
 
 def metric_entries(entries, field=DEFAULT_METRIC):
@@ -468,23 +575,25 @@ COLLECTING_MINUTES_BELOW_SECONDS = 90 * 60
 COLLECTING_MINUTE_STEP = 10
 
 
-def collecting_label(points, now):
-    """「あと約N時間」/「あと約N分」: time left until the window can be projected.
+def collecting_label(points, now, lang=DEFAULT_LANG):
+    """「あと約N時間」/「あと約N分」(en: "~Nh left" / "~Nm left")。
 
-    Hours are too coarse near the end -- the countdown would sit on 「約1時間」
-    for a whole hour -- so switch to 10-minute steps below 90 minutes.
+    Time left until the window can be projected. Hours are too coarse near the
+    end -- the countdown would sit on 「約1時間」 for a whole hour -- so switch
+    to 10-minute steps below 90 minutes.
     """
+    labels = strings(lang)
     if not points:
         remaining = PROJECTION_MIN_SPAN_SECONDS
     else:
         remaining = PROJECTION_MIN_SPAN_SECONDS \
             - (now - points[0]["t"]).total_seconds()
     if remaining >= COLLECTING_MINUTES_BELOW_SECONDS:
-        return "あと約%d時間" % int(math.ceil(remaining / 3600.0))
+        return labels["collecting_hours"] % int(math.ceil(remaining / 3600.0))
     minutes = int(math.ceil(max(0.0, remaining) / 60.0))
     step = COLLECTING_MINUTE_STEP
     minutes = max(step, int(math.ceil(minutes / float(step))) * step)
-    return "あと約%d分" % minutes
+    return labels["collecting_minutes"] % minutes
 
 
 def projection_result(data, now, history, field):
@@ -510,15 +619,19 @@ def projection_result(data, now, history, field):
     return result
 
 
-def projection_text(kind, value):
+def projection_text(kind, value, lang=DEFAULT_LANG):
+    labels = strings(lang)
     if kind == "collecting":
         return None
     if kind == "cross":
-        return "100%%到達 %sごろ" % value.astimezone().strftime("%-m/%-d %-H時")
-    return "リセット時点 ~%d%%" % int(round(value))
+        stamp = value.astimezone().strftime(labels["date_cross"])
+        # strftime の %p は "PM"。英語表記は "2pm" の形にする。
+        stamp = stamp.replace("AM", "am").replace("PM", "pm")
+        return labels["cross"] % stamp
+    return labels["at_reset"] % int(round(value))
 
 
-def projection_rows(state, now, history=None):
+def projection_rows(state, now, history=None, lang=DEFAULT_LANG):
     """The 予測 lines (one per metric), or [] when the state supports none.
 
     Both metrics are projected the same way; only the metric field and its own
@@ -537,22 +650,25 @@ def projection_rows(state, now, history=None):
     if history is None:
         history = read_history()
 
+    labels = strings(lang)
     results = []
-    for field, label in PROJECTION_METRICS:
+    for field, key in PROJECTION_METRICS:
         result = projection_result(data, now, history, field)
         if result is not None:
-            results.append((label, result))
+            results.append((labels[key], result))
     if not results:
         return []
     if all(kind == "collecting" for _, (kind, _) in results):
         # 収集中の残り時間は全指標で同じ(点の時刻が同じ)ので 1 行にまとめる。
         points = results[0][1][1]
-        return ["予測: データ収集中(%s)" % collecting_label(points, now)]
+        return ["%s: %s" % (labels["proj_prefix"],
+                            labels["collecting"]
+                            % collecting_label(points, now, lang))]
     rows = []
     for label, (kind, value) in results:
-        text = projection_text(kind, value) \
-            or "データ収集中(%s)" % collecting_label(value, now)
-        rows.append("%s%s" % (pad_label("予測 " + label), text))
+        text = projection_text(kind, value, lang) \
+            or labels["collecting"] % collecting_label(value, now, lang)
+        rows.append("%s%s" % (pad_label(label, lang=lang), text))
     return rows
 
 
@@ -612,64 +728,70 @@ def title_line(state, now=None):
 
 
 def render(state, now=None, python_path=None, fetch_path=None, log_path=LOG_PATH,
-           history=None, dark=None):
+           history=None, dark=None, lang=DEFAULT_LANG):
     now = now or datetime.now(timezone.utc).astimezone()
     python_path = python_path or sys.executable or "/usr/bin/python3"
     fetch_path = fetch_path or default_fetch_path()
+    labels = strings(lang)
 
     lines = [title_line(state, now), "---"]
 
     data = (state or {}).get("data") if isinstance(state, dict) else None
     if isinstance(data, dict):
-        rows = (("Fable", data.get("fable")),
-                ("週間(全モデル)", data.get("seven_day")),
-                ("セッション(5h)", data.get("five_hour")))
+        rows = ((labels["label_fable"], data.get("fable")),
+                (labels["label_weekly"], data.get("seven_day")),
+                (labels["label_session"], data.get("five_hour")))
         if dark is None:
             dark = is_dark_appearance()
         primary = ANSI_PRIMARY_DARK if dark else None
         for label, entry in rows:
             if not isinstance(entry, dict):
-                lines.append(ansi_row("%s --" % pad_label(label), primary, MONO))
+                lines.append(ansi_row("%s --" % pad_label(label, lang=lang),
+                                      primary, MONO))
                 continue
-            reset = fmt_reset(entry.get("resets_at"), now)
+            reset = fmt_reset(entry.get("resets_at"), now, lang)
             text = ("%s %3s%%   %s" % (
-                pad_label(label), fmt_percent(entry.get("percent")), reset)).rstrip()
+                pad_label(label, lang=lang), fmt_percent(entry.get("percent")),
+                reset)).rstrip()
             lines.append(ansi_row(text, primary, MONO))
-        # 予測行も等幅にしないと 3 枠の行と桁が揃わない。色もアクションも付けない。
-        for projection in projection_rows(state, now, history):
-            lines.append(ansi_row(projection, None, MONO))
+        # 予測行も 3 枠と同じ色・同じ等幅にする(同じ状態表示なので同じ本文色)。
+        for projection in projection_rows(state, now, history, lang):
+            lines.append(ansi_row(projection, primary, MONO))
         lines.append("---")
         age = age_seconds(state, now)
         fetched = parse_iso(state.get("fetched_at"))
         if fetched is not None:
             stamp = fetched.astimezone().strftime("%H:%M:%S")
-            lines.append("取得: %s (%s前)" % (stamp, fmt_duration(age)))
+            lines.append(labels["fetched"] % (stamp, fmt_duration(age, lang)))
         else:
-            lines.append("取得: なし")
+            lines.append(labels["fetched_none"])
     else:
-        lines.append("まだデータがありません")
+        lines.append(labels["no_data"])
         lines.append("---")
 
     if not isinstance(state, dict):
-        lines.append(ansi_row("エラー: state.json が見つからないか読めません",
-                              ANSI_ERROR))
+        lines.append(ansi_row(labels["error_no_state"], ANSI_ERROR))
     elif state.get("error"):
         at = parse_iso(state.get("error_at"))
         stamp = at.astimezone().strftime("%H:%M:%S") if at else "?"
-        lines.append(ansi_row("エラー: %s (%s)" % (state.get("error"), stamp),
+        lines.append(ansi_row(labels["error"] % (state.get("error"), stamp),
                               ANSI_ERROR))
 
     lines.append("---")
-    lines.append("リフレッシュ | bash=%s param1=%s param2=--force terminal=false "
-                 "refresh=true sfimage=arrow.clockwise" % (python_path, fetch_path))
-    lines.append("使用量ページを開く | href=%s sfimage=safari" % USAGE_PAGE_URL)
-    lines.append("ログを開く | bash=/usr/bin/open param1=%s terminal=false "
-                 "sfimage=doc.text" % log_path)
+    lines.append("%s | bash=%s param1=%s param2=--force terminal=false "
+                 "refresh=true sfimage=arrow.clockwise"
+                 % (labels["refresh"], python_path, fetch_path))
+    lines.append("%s | href=%s sfimage=safari"
+                 % (labels["open_usage"], USAGE_PAGE_URL))
+    lines.append("%s | bash=/usr/bin/open param1=%s terminal=false "
+                 "sfimage=doc.text" % (labels["open_log"], log_path))
     return "\n".join(lines)
 
 
 def main():
-    sys.stdout.write(render(read_state()) + "\n")
+    state = read_state()
+    lang = resolve_lang(read_config(), state)
+    sys.stdout.write(render(state, lang=lang) + "\n")
     return 0
 
 

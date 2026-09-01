@@ -105,12 +105,15 @@ claude-usage-tracker/          (GitHub: fable-meter)
 
 - 引数: `--dry-run`(state.json を書かず JSON を stdout へ)、`--verbose`(ログを stderr にも)、`--force`(スリープ復帰スキップを無視)
 - 出力: `~/.cache/fable-meter/state.json`(atomic: `state.json.tmp` に書いて `os.replace`)、
-  `~/.cache/fable-meter/history.jsonl`(0600、追記)
+  `~/.cache/fable-meter/history.jsonl`(0600、追記)、
+  `~/.config/fable-meter/config.json`(**無いときだけ**既定値で作成。§4.3)
 - ログ: `~/.cache/fable-meter/fetch.log`(200KB でローテート、1世代)
 - 終了コード: 0 成功 / 1 取得失敗(state.json はエラー状態で更新済み) / 2 引数エラー
 
 ### 処理
 
+0. 言語の解決(§4.3): `system_locale_lang()` を**1フェッチにつき1回**呼び、
+   `config.json` と合わせて通知の言語を決める。結果のロケールは state.json に載せて表示層へ渡す。
 1. スリープ復帰判定: `sysctl -n kern.waketime` の秒が現在時刻から 60 秒以内なら**1回スキップ**(`--force` で無視)。state.json は更新しない。
 2. Keychain 読み取り: `security find-generic-password -s "Claude Code-credentials" -w`。失敗 → `keychain_error`。JSON 不正 → `keychain_parse_error`。
 3. `claudeAiOauth.expiresAt` が現在時刻以下 → API を呼ばずに `token_expired`。
@@ -145,9 +148,13 @@ claude-usage-tracker/          (GitHub: fable-meter)
     "scoped":    [{"name": "Fable", "percent": 12, "resets_at": "...", "severity": "normal"}],
     "plan": "max"
   },
-  "last_notified_band": 0
+  "last_notified_band": 0,
+  "locale_lang": "ja"
 }
 ```
+
+`locale_lang` は取得層が解決したシステムロケール(`"ja"` / `"en"` / `null`)。表示層の
+`"auto"` はこれを見る(§4.3)。schema は据え置き(欠けていても表示層は既定に落ちる)。
 
 `last_notified_band` は閾値通知の状態(0 = 平常 / 1 = 80% 済 / 2 = 95% 済)。失敗時も直前の値を保持する。
 壊れた値(非 int、範囲外)は 0 として扱う。
@@ -184,6 +191,24 @@ claude-usage-tracker/          (GitHub: fable-meter)
 - ログに書くのは: 時刻、結果コード、HTTP ステータス、レスポンス本文の先頭 300 文字(エラー時のみ)。リクエストヘッダは書かない。
 - `--dry-run` の出力にもトークンは含めない(state.json と同じ形)。
 
+### 4.3 設定と言語(`config.json` / `locale_lang`)
+
+- 設定ファイルは `~/.config/fable-meter/config.json`。**キャッシュではないので `~/.cache` に置かない**
+  (`uninstall.sh --purge` はキャッシュを消すが、設定は残すべきもの)。
+- スキーマは `{"lang": "auto" | "ja" | "en"}`、既定は `"auto"`。無い/壊れている/知らない値は
+  **すべて既定にフォールバック**し、例外にしない(設定ミスで表示が止まらないこと)。
+- 取得層は起動時に `ensure_config()` で**無いときだけ**既定値を書く(ディレクトリ 0700、ファイル 0600)。
+  既存ファイルには触らない。普段は**ユーザーが手で編集する**ファイル。
+- `"auto"` のシステムロケール解決は**取得層**が行う: SwiftBar がプラグインに渡す環境には
+  `LANG` / `LC_ALL` が無いことが多く、表示層だけでは判定できない。
+  `subprocess /usr/bin/defaults read -g AppleLocale` →(失敗/空なら)環境変数 `LC_ALL` / `LANG` →
+  それでも駄目なら `"en"`。先頭が `ja` なら `"ja"`、それ以外は `"en"`。
+  5分に1回のフェッチで1回だけ呼ぶので実行コストは無視できる。
+- 解決結果は state.json の `locale_lang` に書き、表示層はそれを読む(表示層はサブプロセスを起動しない)。
+- 有効言語 = `resolve_lang(config, locale_lang)`: **明示指定(ja/en)> locale_lang > en**。
+  取得層(通知)と表示層(メニュー)で同じ規則・同じ優先順位を使う。
+- 通知文(§4.2)も同じ有効言語で切り替える(`NOTIFY_TEXT`)。差し込むのは整数2つだけという規約は不変。
+
 ## 5. 表示層 `plugin/fable.10s.py`
 
 - ドロップダウンの状態表示行(3枠・予測・取得・エラー・データ無し)には **`color=` を付けない**。
@@ -202,7 +227,7 @@ claude-usage-tracker/          (GitHub: fable-meter)
 
 macOS 26(Tahoe、実測 26.3 / build 25D125)では、**無効な `NSMenuItem` でもポインタを
 載せると選択ハイライト(紫)が描かれる**。`color=` の有無・`ansi` の有無とは無関係で、
-色を一切付けていない `予測:` / `取得:` 行でも同じように出ることを全行で実測した。
+色を一切付けていない `取得:` 行でも同じように出ることを全行で実測した。
 クリックは無効のまま効かないが、ハイライトの抑止は
 - プラグイン側の出力(SwiftBar には `disabled=` が無い)
 - SwiftBar のバージョン(最新リリース 2.1.1 も main も判定は同じ)
@@ -222,8 +247,9 @@ macOS 26(Tahoe、実測 26.3 / build 25D125)では、**無効な `NSMenuItem` �
     ライト/ダーク自動。ただし `39` は「前景色を消す」に予約されていて `labelColor` は取れない。
   - 256 色(16-231)の RGB 変換式は上流にバグがあり、実質「青寄りの派手な色」しか出ない。
     その中で無彩色に近いのは 189 = `(247,248,255)`(ほぼ白)。
-- 実際の割り当て: 3 枠の行 = ダークのみ `\e[38;5;189m`(本文色相当)、ライトは無色
-  (ANSI に「黒に近い有彩色」が無いため)。`予測:` / `取得:` 行 = 無色(副次情報)。
+- 実際の割り当て: 3 枠の行と `予測` 行 = ダークのみ `\e[38;5;189m`(本文色相当)、ライトは無色
+  (ANSI に「黒に近い有彩色」が無いため)。予測も同じ状態表示なので 3 枠と同じ本文色にする。
+  `取得:` 行 = 無色(副次情報)。
   エラー行 = `\e[31m`(`systemRed`)。赤が出るので ⚠️ プレフィクスは廃止。
 - ライト/ダークの判定は SwiftBar が渡す `OS_APPEARANCE`(`Plugin.swift:296`)。
   テーマ切替時にプラグインは再実行されず既存出力を再描画するだけ
@@ -243,7 +269,7 @@ macOS 26(Tahoe、実測 26.3 / build 25D125)では、**無効な `NSMenuItem` �
 | `ok == false` かつ鮮度は正常/10分未満 | `F12%! W9%! S6%!`(値は残すが失敗中であることを示す) |
 
 - 色(Fable の % で決める。SwiftBar は背景色を変えられないので文字色で代替): 80% 超 → `color=#e0a800`(黄)、95% 超 → `color=#d0021b`(赤)。それ以外はデフォルト。鮮度異常(`?`/`--`)時はグレー `color=#8e8e93`。
-- ドロップダウン(日本語。ラベルは全角幅を2桁として計算し、等幅 `font=Menlo size=12` で桁を揃える):
+- ドロップダウン(日本語 or 英語。§5.1。ラベルは全角幅を2桁として計算し、等幅 `font=Menlo size=12` で桁を揃える):
   ```
   Fable             12%   リセット 9/4 23:59 (あと5日2時間)
   週間(全モデル)      9%   リセット 9/4 24:00 (あと5日3時間)
@@ -258,6 +284,23 @@ macOS 26(Tahoe、実測 26.3 / build 25D125)では、**無効な `NSMenuItem` �
   使用量ページを開く | href=https://claude.ai/settings/usage sfimage=safari
   ログを開く        | bash=open param1=~/.cache/fable-meter/fetch.log terminal=false sfimage=doc.text
   ```
+
+### 5.1 文言テーブル(`STRINGS`)
+
+- ユーザーに見える文字列は**すべて** `STRINGS = {"ja": {...}, "en": {...}}` の1枚のテーブルに置く。
+  対象: 3 枠のラベル、`リセット` / `あと…`、`予測 Fable` / `予測 週間`、`リセット時点 ~N%`、
+  `100%到達 …ごろ`、`データ収集中(あと約N時間/分)`、`取得: …前`、`エラー:`、
+  `まだデータがありません`、`リフレッシュ` / `使用量ページを開く` / `ログを開く`。
+  書式指定子の数と並びは両言語で同じにする(片方だけ壊れないため)。
+- 日付は ja が `9/5 00:00` / `9/3 14時`、en が `Sep 5 00:00` / `Sep 3, 2pm`(`%p` は小文字化)。
+  期間は ja が `3日19時間`、en が `3d 19h`。
+- ラベル幅は言語ごと(`LABEL_WIDTHS`): ja は 16 セル(全角ラベルが 14 セル)、
+  en は 21 セル(`Weekly (all models)` が 19 セル)。`pad_label()` は東アジア文字幅を数えるので、
+  英語ラベルでも 3 枠と予測行の桁が揃う。
+- 言語の解決(`read_config()` + `resolve_lang()`)は `main()` だけが行い、`render()` 以下は
+  `lang` を引数で受ける純関数のまま(テストで両言語を直接指定できる)。
+  `config.json` は毎回読む(ローカルの小さな JSON なので 10 秒周期でも十分速い)。
+  引数を省いたときの既定は `"ja"`(このツールの原語)。
 
 ### ペース予測(`予測 Fable` / `予測 週間` 行)
 
@@ -406,7 +449,8 @@ projected = 最新% + slope × remaining
 
 #### 7. その他
 
-- 色は付けない(下記の理由)。
+- 色は 3 枠の行と同じ(ダークのみ ANSI 189、ライトは無色)。等幅も 3 枠と同じ。
+  クリックはできない(`ansi=true` のみで `color=` は付けない)。
 - すべて純関数で、`now` は注入できる。表示層はネットワークにも Keychain にもアクセスしない。
 
 - リセット時刻は `astimezone()` でローカル時刻に変換して表示する。
@@ -441,7 +485,8 @@ install.sh(冪等):
 8. 結果の確認方法を表示。
 
 uninstall.sh: bootout → plist 削除 → プラグイン削除 → キャッシュ削除は `--purge` 指定時のみ
-(`--purge` は `~/.cache/fable-meter/` ごと消すので `history.jsonl` も消える)。
+(`--purge` は `~/.cache/fable-meter/` ごと消すので `history.jsonl` も消える。
+設定 `~/.config/fable-meter/config.json` はキャッシュではないので**消さない**)。
 
 ## 8. テスト(`python3 -m unittest`)
 
@@ -452,6 +497,14 @@ uninstall.sh: bootout → plist 削除 → プラグイン削除 → キャッ�
 - `test_plugin.py`: 鮮度 0/11/31 分で `F12% W9% S6%` / `F12%? …` / `F-- …` になる。`ok=false` で `!`。80%/95% 超で色パラメータが付く。state.json 欠落で `--`。日本語ラベル・`リセット` / `リフレッシュ` / `使用量ページを開く` / `ログを開く` が出る。
 - `test_plugin.py`(予測): 通常の線形予測、窓の跨ぎ(リセットを挟むと古い点を捨てる)、
   データ不足で行が出ない、100% 超で到達時刻に切り替わる、失敗中/古い state では出さない。
+- `test_plugin.py`(言語): 設定の優先順位(明示 > auto > 既定 en)、壊れた/非オブジェクトの
+  config.json を許容する、`~/.config` にあること、英語レンダリング(ラベル・操作行・`fetched:` 行・
+  期間 `3d 19h`・`resets Sep 5 00:00`・`~81% at reset`・`hits 100% ~Sep 3, 2pm`・
+  `collecting data (~3h left)`・`No data yet` / `Error:`)、英語でも桁が揃うこと、
+  予測行が 3 枠と同じ ANSI 189 になり(両言語)ライトでは無色のままであること。
+- `test_fetch.py`(言語): `AppleLocale` からの判定、環境変数フォールバック、既定 en、
+  `resolve_lang` の優先順位、`ensure_config` が 0600 で作り既存を上書きしないこと、
+  state に `locale_lang` が載り失敗時も引き継がれること、通知文の ja/en。
 - `test_plugin.py`(適応予測): 成分Aの重み付き傾き(加速する系列で直近が効く・端点が同じでも
   消費が直近に寄っている方が速い・2点なら端点傾きと一致・傾きの 0 クランプ・同時刻でも落ちない)、
   成分Bのカーブ生成(時刻境界をまたぐ按分・正規化・2日分の加算・窓またぎのペアを無視・

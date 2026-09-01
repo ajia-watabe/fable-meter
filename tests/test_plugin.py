@@ -869,5 +869,222 @@ class SevenDayMetricTest(unittest.TestCase):
             self.assertEqual(len(plugin.metric_entries(entries, "seven_day")), 1)
 
 
+class LanguageConfigTest(unittest.TestCase):
+    def test_explicit_language_wins_over_the_system_locale(self):
+        state = {"locale_lang": "ja"}
+        self.assertEqual(plugin.resolve_lang({"lang": "en"}, state), "en")
+        self.assertEqual(plugin.resolve_lang({"lang": "ja"},
+                                             {"locale_lang": "en"}), "ja")
+
+    def test_auto_falls_back_to_the_state_locale(self):
+        self.assertEqual(
+            plugin.resolve_lang({"lang": "auto"}, {"locale_lang": "ja"}), "ja")
+        self.assertEqual(
+            plugin.resolve_lang({"lang": "auto"}, {"locale_lang": "en"}), "en")
+
+    def test_missing_lang_key_is_auto(self):
+        self.assertEqual(plugin.resolve_lang({}, {"locale_lang": "ja"}), "ja")
+
+    def test_unknown_value_is_treated_as_auto(self):
+        self.assertEqual(
+            plugin.resolve_lang({"lang": "fr"}, {"locale_lang": "ja"}), "ja")
+
+    def test_no_state_defaults_to_english(self):
+        self.assertEqual(plugin.resolve_lang({"lang": "auto"}, None), "en")
+        self.assertEqual(plugin.resolve_lang(None, None), "en")
+        self.assertEqual(plugin.resolve_lang({}, {"locale_lang": "zz"}), "en")
+
+    def test_case_and_padding_are_tolerated(self):
+        self.assertEqual(plugin.resolve_lang({"lang": " EN "}, None), "en")
+        self.assertEqual(plugin.resolve_lang({}, {"locale_lang": "JA"}), "ja")
+
+    def test_read_config_missing_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(
+                plugin.read_config(os.path.join(tmp, "nope.json")), {})
+
+    def test_read_config_tolerates_a_corrupt_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("{ not json")
+            self.assertEqual(plugin.read_config(path), {})
+            # A corrupt config must not change the language either.
+            self.assertEqual(
+                plugin.resolve_lang(plugin.read_config(path),
+                                    {"locale_lang": "ja"}), "ja")
+
+    def test_read_config_ignores_a_non_object_document(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write('["en"]')
+            self.assertEqual(plugin.read_config(path), {})
+
+    def test_read_config_reads_a_hand_written_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write('{"lang": "en"}\n')
+            self.assertEqual(plugin.read_config(path), {"lang": "en"})
+
+    def test_config_path_is_outside_the_cache_dir(self):
+        # --purge deletes the cache dir; settings must survive it.
+        self.assertNotIn(plugin.CACHE_DIR, plugin.CONFIG_PATH)
+        self.assertTrue(plugin.CONFIG_PATH.endswith(
+            os.path.join(".config", "fable-meter", "config.json")))
+
+
+class EnglishRenderTest(unittest.TestCase):
+    def history(self):
+        return [point(12, 6, seven_day=4), point(0, 12, seven_day=8)]
+
+    def render(self, state=None, **kwargs):
+        kwargs.setdefault("python_path", "/p/python3")
+        kwargs.setdefault("fetch_path", "/r/fetch.py")
+        kwargs.setdefault("history", self.history())
+        return plugin.render(make_state(3) if state is None else state, NOW,
+                             lang="en", **kwargs)
+
+    def test_labels_and_actions_are_english(self):
+        out = self.render()
+        self.assertIn("Weekly (all models)", out)
+        self.assertIn("Session (5h)", out)
+        self.assertIn("resets ", out)
+        self.assertNotIn("週間", out)
+        self.assertNotIn("リセット", out)
+        self.assertNotIn("取得", out)
+        self.assertIn("Refresh | bash=/p/python3 param1=/r/fetch.py", out)
+        self.assertIn("Open usage page | href=", out)
+        self.assertIn("Open log | bash=/usr/bin/open", out)
+
+    def test_fetched_row_is_english(self):
+        rows = [ln for ln in self.render().split("\n")
+                if ln.startswith("fetched: ")]
+        self.assertEqual(rows, ["fetched: %s (3m ago)"
+                                % (NOW - timedelta(minutes=3)).astimezone()
+                                .strftime("%H:%M:%S")])
+
+    def test_durations_are_compact_english(self):
+        self.assertEqual(plugin.fmt_duration(0, "en"), "0m")
+        self.assertEqual(plugin.fmt_duration(90, "en"), "1m")
+        self.assertEqual(plugin.fmt_duration(3600 * 3 + 60 * 21, "en"), "3h 21m")
+        self.assertEqual(plugin.fmt_duration(86400 * 3 + 3600 * 19, "en"),
+                         "3d 19h")
+
+    def test_reset_line_is_english(self):
+        self.assertEqual(
+            plugin.fmt_reset("2026-09-04T23:05:00+00:00", NOW, "en"),
+            "resets %s (6d 2h left)"
+            % plugin.parse_iso("2026-09-04T23:05:00+00:00").astimezone()
+            .strftime("%b %-d %H:%M"))
+        # Inside 24h the date is dropped in both languages.
+        self.assertTrue(
+            plugin.fmt_reset("2026-08-29T22:00:00+00:00", NOW, "en")
+            .startswith("resets "))
+        self.assertTrue(
+            plugin.fmt_reset("2026-08-29T20:00:00+00:00", NOW, "en")
+            .startswith("resets "))
+
+    def test_forecast_rows_are_english(self):
+        rows = plugin.projection_rows(make_state(0), NOW, self.history(), "en")
+        self.assertEqual(rows, ["Forecast Fable       ~81% at reset",
+                                "Forecast Weekly      ~54% at reset"])
+
+    def test_forecast_crossing_row_is_english(self):
+        history = [point(10, 10, seven_day=10), point(0, 50, seven_day=50)]
+        rows = plugin.projection_rows(make_state(0, fable=50), NOW, history,
+                                      "en")
+        stamp = (NOW + timedelta(hours=12.5)).astimezone().strftime(
+            "%b %-d, %-I%p").replace("AM", "am").replace("PM", "pm")
+        self.assertEqual(rows[0], "Forecast Fable       hits 100%% ~%s" % stamp)
+
+    def test_collecting_rows_are_english(self):
+        self.assertEqual(plugin.collecting_label([], NOW, "en"), "~3h left")
+        self.assertEqual(
+            plugin.collecting_label([point(175 / 60.0, 1)], NOW, "en"),
+            "~10m left")
+        self.assertEqual(plugin.projection_rows(make_state(0), NOW, [], "en"),
+                         ["Forecast: collecting data (~3h left)"])
+        self.assertEqual(
+            plugin.projection_rows(make_state(0), NOW,
+                                   [point(12, 6), point(0, 12)], "en"),
+            ["Forecast Fable       ~81% at reset",
+             "Forecast Weekly      collecting data (~3h left)"])
+
+    def test_english_labels_still_line_up(self):
+        # pad_label is east-asian-width aware; English labels are all
+        # single-cell but longer, so they get their own column width.
+        self.assertEqual(plugin.display_width(
+            plugin.pad_label("Weekly (all models)", lang="en")),
+            plugin.LABEL_WIDTH_EN)
+        self.assertEqual(plugin.display_width(
+            plugin.pad_label("Session (5h)", lang="en")),
+            plugin.LABEL_WIDTH_EN)
+        rows = plugin.projection_rows(make_state(0), NOW, self.history(), "en")
+        self.assertEqual(
+            {plugin.display_width(r.split("~")[0]) for r in rows},
+            {plugin.LABEL_WIDTH_EN})
+        # The percent column starts at the same cell on all three limit rows.
+        limit = [ln.split(" | ")[0].replace(plugin.ANSI_PRIMARY_DARK, "")
+                 for ln in self.render(make_state(0), dark=True).split("\n")
+                 if "resets" in ln]
+        self.assertEqual(len(limit), 3)
+        self.assertEqual({row.index("%") for row in limit},
+                         {plugin.LABEL_WIDTH_EN + 4})
+
+    def test_no_data_and_error_rows_are_english(self):
+        state = make_state(0)
+        state["data"] = None
+        self.assertIn("\nNo data yet\n", self.render(state))
+        row = [ln for ln in self.render(
+            make_state(3, ok=False, error="token_expired")).split("\n")
+            if "token_expired" in ln][0]
+        self.assertTrue(row.startswith(plugin.ANSI_ERROR + "Error: "))
+        self.assertIn("Error: state.json is missing or unreadable",
+                      plugin.render(None, NOW, lang="en"))
+
+
+class ForecastRowColourTest(unittest.TestCase):
+    def history(self):
+        return [point(12, 6, seven_day=4), point(0, 12, seven_day=8)]
+
+    def forecast_rows(self, out):
+        return [ln for ln in out.split("\n")
+                if "予測" in ln or "Forecast" in ln]
+
+    def test_forecast_rows_use_the_same_near_white_as_the_limit_rows(self):
+        for lang in ("ja", "en"):
+            out = plugin.render(make_state(0), NOW, history=self.history(),
+                                dark=True, lang=lang)
+            rows = self.forecast_rows(out)
+            self.assertEqual(len(rows), 2, lang)
+            for row in rows:
+                self.assertTrue(row.startswith(plugin.ANSI_PRIMARY_DARK), row)
+                self.assertIn("ansi=true", row)
+                self.assertIn("font=Menlo size=12", row)
+                # Still an information row: no action, no color= parameter.
+                self.assertNotIn("color=", row)
+                self.assertNotIn("bash=", row)
+                self.assertNotIn("href=", row)
+
+    def test_all_five_state_rows_are_coloured_together(self):
+        out = plugin.render(make_state(0), NOW, history=self.history(),
+                            dark=True)
+        coloured = [ln for ln in out.split("\n")
+                    if ln.startswith(plugin.ANSI_PRIMARY_DARK)]
+        self.assertEqual(len(coloured), 5)
+
+    def test_forecast_rows_stay_uncoloured_in_light_appearance(self):
+        out = plugin.render(make_state(0), NOW, history=self.history(),
+                            dark=False)
+        rows = self.forecast_rows(out)
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            self.assertNotIn(plugin.ESC, row)
+            self.assertNotIn("ansi=true", row)
+            self.assertIn("font=Menlo size=12", row)
+
+
 if __name__ == "__main__":
     unittest.main()

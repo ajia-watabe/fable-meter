@@ -26,7 +26,13 @@ KEYCHAIN_SERVICE = "Claude Code-credentials"
 SECURITY_BIN = "/usr/bin/security"
 SYSCTL_BIN = "/usr/sbin/sysctl"
 OSASCRIPT_BIN = "/usr/bin/osascript"
+DEFAULTS_BIN = "/usr/bin/defaults"
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "fable-meter")
+# 設定はキャッシュではないので ~/.config に置く(uninstall.sh --purge で消えない)。
+CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".config", "fable-meter")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+DEFAULT_CONFIG = {"lang": "auto"}
+LANGS = ("ja", "en")
 STATE_PATH = os.path.join(CACHE_DIR, "state.json")
 LOG_PATH = os.path.join(CACHE_DIR, "fetch.log")
 HISTORY_PATH = os.path.join(CACHE_DIR, "history.jsonl")
@@ -37,6 +43,11 @@ HISTORY_MAX_DAYS = 8
 # 閾値通知のバンド: 0 = 平常, 1 = 80% 以上, 2 = 95% 以上。
 NOTIFY_THRESHOLDS = ((2, 95), (1, 80))
 NOTIFY_TITLE = "fable-meter"
+# 通知文。差し込むのは整数 2 つ(閾値と現在値)だけ。
+NOTIFY_TEXT = {
+    "ja": "Fable が%d%%を超えました(現在 %d%%)",
+    "en": "Fable exceeded %d%% (now %d%%)",
+}
 # resets_at はフェッチごとに秒未満が揺れるので、この秒数以下の前進は無視する。
 RESET_JITTER_SECONDS = 60
 
@@ -85,6 +96,78 @@ def log(message, verbose=False):
         pass
     if verbose:
         sys.stderr.write(line + "\n")
+
+
+# ----------------------------------------------------------------------- config
+
+def read_config(path=CONFIG_PATH):
+    """~/.config/fable-meter/config.json。無い/壊れている → {}(既定に落ちる)。"""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            config = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return config if isinstance(config, dict) else {}
+
+
+def ensure_config(path=CONFIG_PATH):
+    """設定ファイルが無ければ既定値で作る(ディレクトリ 0700・ファイル 0600)。
+
+    普段は**ユーザーが手で編集する**ファイルなので、既存の内容には触らない。
+    """
+    if os.path.exists(path):
+        return False
+    directory = os.path.dirname(path)
+    if directory:
+        _ensure_private_dir(directory)
+    with _open_private(path, "w") as fh:
+        json.dump(DEFAULT_CONFIG, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+    return True
+
+
+def _lang_from_locale(text):
+    """"ja_JP" / "ja-JP.UTF-8" → "ja"、それ以外 → "en"。"""
+    if not isinstance(text, str):
+        return None
+    value = text.strip().lower()
+    if not value:
+        return None
+    return "ja" if value.startswith("ja") else "en"
+
+
+def system_locale_lang(env=None):
+    """システムロケール → "ja" / "en"。取得のたびに1回だけ呼ぶ(5分に1回)。
+
+    SwiftBar がプラグインに渡す環境には LANG が無いことが多いので、判定は
+    取得層で行い、結果を state.json の `locale_lang` に置いて表示層に渡す。
+    """
+    try:
+        out = subprocess.run(
+            [DEFAULTS_BIN, "read", "-g", "AppleLocale"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    lang = _lang_from_locale(out)
+    if lang:
+        return lang
+    env = os.environ if env is None else env
+    for key in ("LC_ALL", "LANG"):
+        lang = _lang_from_locale(env.get(key))
+        if lang:
+            return lang
+    return "en"
+
+
+def resolve_lang(config=None, locale_lang=None):
+    """明示指定(ja/en)> 解決済みのシステムロケール > en。表示層と同じ規則。"""
+    value = (config or {}).get("lang")
+    if isinstance(value, str) and value.strip().lower() in LANGS:
+        return value.strip().lower()
+    if isinstance(locale_lang, str) and locale_lang.strip().lower() in LANGS:
+        return locale_lang.strip().lower()
+    return "en"
 
 
 # ------------------------------------------------------------------- wake check
@@ -463,13 +546,21 @@ def evaluate_band(previous_state, fable):
     return max(last, current), None
 
 
-def notify(band, percent, verbose=False):
-    """Fire a macOS notification. Only the integer percent is interpolated."""
+def notification_text(band, percent, lang="ja"):
+    """通知の本文。差し込むのは整数のみ。未知のバンド → None。"""
     threshold = dict((b, t) for b, t in NOTIFY_THRESHOLDS).get(band)
     if threshold is None:
+        return None
+    template = NOTIFY_TEXT.get(lang) or NOTIFY_TEXT["en"]
+    return template % (threshold, int(percent))
+
+
+def notify(band, percent, verbose=False, lang="ja"):
+    """Fire a macOS notification. Only the integer percent is interpolated."""
+    body = notification_text(band, percent, lang)
+    if body is None:
         return False
-    script = 'display notification "Fable が%d%%を超えました(現在 %d%%)" with title "%s"' % (
-        threshold, int(percent), NOTIFY_TITLE)
+    script = 'display notification "%s" with title "%s"' % (body, NOTIFY_TITLE)
     try:
         subprocess.run([OSASCRIPT_BIN, "-e", script],
                        capture_output=True, timeout=10)
@@ -493,7 +584,7 @@ def load_state(path=STATE_PATH):
     return state
 
 
-def build_success_state(data, now=None, last_notified_band=0):
+def build_success_state(data, now=None, last_notified_band=0, locale_lang=None):
     now = now or datetime.now(timezone.utc).astimezone()
     return {
         "schema": SCHEMA,
@@ -503,10 +594,12 @@ def build_success_state(data, now=None, last_notified_band=0):
         "error_at": None,
         "data": data,
         "last_notified_band": stored_band({"last_notified_band": last_notified_band}),
+        # 表示層は LANG を持たないので、解決済みのシステムロケールをここで渡す。
+        "locale_lang": locale_lang if locale_lang in LANGS else None,
     }
 
 
-def build_error_state(code, previous=None, now=None):
+def build_error_state(code, previous=None, now=None, locale_lang=None):
     """Keep the previous data/fetched_at so the UI can judge staleness."""
     now = now or datetime.now(timezone.utc).astimezone()
     previous = previous if isinstance(previous, dict) else {}
@@ -518,6 +611,9 @@ def build_error_state(code, previous=None, now=None):
         "error_at": now.isoformat(),
         "data": previous.get("data"),
         "last_notified_band": stored_band(previous),
+        # 失敗時も直前の解決結果を残す(表示だけは正しい言語で続けられる)。
+        "locale_lang": locale_lang if locale_lang in LANGS
+        else previous.get("locale_lang"),
     }
 
 
@@ -540,6 +636,13 @@ def run(dry_run=False, verbose=False, force=False):
         return 0
 
     previous = load_state()
+    locale_lang = system_locale_lang()
+    if not dry_run:
+        try:
+            ensure_config()
+        except OSError:
+            log("error=config_write_failed", verbose)
+    lang = resolve_lang(read_config(), locale_lang)
     try:
         token, expires_at, plan = read_token()
         try:
@@ -552,7 +655,7 @@ def run(dry_run=False, verbose=False, force=False):
     except FetchError as exc:
         detail = (" detail=%s" % exc.detail) if exc.detail else ""
         log("error=%s%s" % (exc.code, detail), verbose)
-        state = build_error_state(exc.code, previous)
+        state = build_error_state(exc.code, previous, locale_lang=locale_lang)
         if dry_run:
             json.dump(state, sys.stdout, ensure_ascii=False, indent=2)
             sys.stdout.write("\n")
@@ -564,7 +667,8 @@ def run(dry_run=False, verbose=False, force=False):
         return 1
 
     band, notify_percent = evaluate_band(previous, data["fable"])
-    state = build_success_state(data, last_notified_band=band)
+    state = build_success_state(data, last_notified_band=band,
+                                locale_lang=locale_lang)
     log("ok fable=%s weekly=%s session=%s" % (
         data["fable"]["percent"],
         data["seven_day"]["percent"] if data["seven_day"] else None,
@@ -581,7 +685,7 @@ def run(dry_run=False, verbose=False, force=False):
     except OSError:
         log("error=history_write_failed", verbose)
     if notify_percent is not None:
-        notify(band, notify_percent, verbose)
+        notify(band, notify_percent, verbose, lang=lang)
     return 0
 
 

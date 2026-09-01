@@ -11,7 +11,8 @@
 > its own. The whole thing is a few hundred lines of dependency-free Python, so
 > you can read it yourself before trusting it. Provided as-is under the MIT
 > license, with **no support and no guarantees**. Requires macOS, a logged-in
-> Claude Code, and Homebrew.
+> Claude Code, and Homebrew. The menu follows your system language (Japanese or
+> English); set `lang` in `~/.config/fable-meter/config.json` to force one.
 
 ## 読む前に(重要)
 
@@ -107,6 +108,46 @@ cat ~/.cache/fable-meter/state.json
 python3 plugin/fable.10s.py     # 1行目が "F13% W10% S9%" 形式
 ```
 
+## 設定
+
+`~/.config/fable-meter/config.json`(**キャッシュとは別の場所**。`./uninstall.sh --purge` でも消えない)。
+無ければ取得時に既定値で自動生成する(ディレクトリ `0700`、ファイル `0600`)。
+普段は**手で編集する**ファイルで、書き換えは次の描画(最大10秒)で反映される。
+
+```json
+{
+  "lang": "auto"
+}
+```
+
+| `lang` | 表示 |
+|---|---|
+| `"auto"`(既定) | システムのロケール(`defaults read -g AppleLocale`)が `ja` なら日本語、それ以外は英語 |
+| `"ja"` | 常に日本語 |
+| `"en"` | 常に英語 |
+
+ファイルが無い・壊れている・知らない値のときは `auto` として扱う(設定ミスで表示が止まることはない)。
+ロケールの判定は取得層(`fetch.py`)が5分ごとに1回だけ行い、結果を `state.json` の `locale_lang` に置く。
+SwiftBar がプラグインに渡す環境には `LANG` が無いことが多く、表示層だけでは判定できないため。
+
+英語表示のドロップダウン:
+
+```
+Fable                  13%   resets Sep 4 23:59 (6d 2h left)
+Weekly (all models)    10%   resets Sep 5 00:00 (6d 2h left)
+Session (5h)            9%   resets 01:00 (3h 8m left)
+Forecast Fable       ~34% at reset
+Forecast Weekly      ~27% at reset
+---
+fetched: 21:50:36 (1m ago)
+---
+Refresh
+Open usage page
+Open log
+```
+
+macOS 通知(80% / 95%)も同じ設定に従う。
+
 ## アンインストール
 
 ```bash
@@ -115,6 +156,7 @@ python3 plugin/fable.10s.py     # 1行目が "F13% W10% S9%" 形式
 ```
 
 `--purge` は `state.json` / `fetch.log` に加えて、予測用の履歴 `history.jsonl` も消す。
+設定 `~/.config/fable-meter/config.json` は**キャッシュではないので残る**(→ [設定](#設定))。
 
 SwiftBar 本体は残る(不要なら `brew uninstall --cask swiftbar`)。
 
@@ -136,7 +178,7 @@ SwiftBar 本体は残る(不要なら `brew uninstall --cask swiftbar`)。
 **取得に失敗しても直前の値は上書きしない。** 代わりに `!` / `?` / `--` で古さと失敗を明示する
 (古い値を「現在値」として誤読させないため)。
 
-ドロップダウンは日本語表示。各枠の % とリセット時刻、ペース予測、最終取得時刻、エラー、
+ドロップダウンは日本語または英語(→ [設定](#設定))。各枠の % とリセット時刻、ペース予測、最終取得時刻、エラー、
 `リフレッシュ`(手動取得)、`使用量ページを開く`、`ログを開く` がある。
 
 ```
@@ -172,7 +214,7 @@ SwiftBar v2.1.1 `SwiftBar/MenuBar/MenuBarItem.swift:1518`)。
 操作行 3 つだけが `enabled=true`)。
 
 **ただし macOS 26(Tahoe)では、無効項目でもポインタを載せると紫のハイライトが描かれる。**
-これは AppKit 側の描画で、`color=` を外しても `ansi` にしても、`予測`/`取得:` のように
+これは AppKit 側の描画で、`color=` を外しても `ansi` にしても、`取得:` のように
 色を一切付けていない行でも同じように出る(macOS 26.3 / SwiftBar 2.1.1 で全行を実測)。
 クリックは効かない(無効項目のまま)が、ハイライト自体はプラグイン側からも
 SwiftBar 側からも消せない。SwiftBar の最新リリースも未リリースの main も
@@ -180,8 +222,9 @@ SwiftBar 側からも消せない。SwiftBar の最新リリースも未リリ�
 
 - 3 枠の行: ダークのとき ANSI 256 色 189(ほぼ白)で本文色に上げる。
   ライトは ANSI パレットに「黒に近い有彩色」が無いのでデフォルトのまま。
-- `予測` / `取得:` 行: 色を付けない(macOS 標準の淡色 = 副次情報)。予測行は 3 枠と桁を
-  揃えるため等幅(`font=Menlo`)にしている。
+- `予測` 行: 3 枠と同じ扱い(ダークは同じ ANSI 189、ライトは無色、等幅 `font=Menlo`)。
+  同じ状態表示なので同じ本文色にしている。クリックはできない。
+- `取得:` 行: 色を付けない(macOS 標準の淡色 = 副次情報)。
 - エラー行: ANSI 31(`NSColor.systemRed`、ライト/ダーク自動)で赤。⚠️ の代用は不要になったので外した。
 
 なお無効項目でも AppKit は**有彩色**の `attributedTitle` をそのまま描くが、

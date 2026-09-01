@@ -323,5 +323,150 @@ class NotifyBandTest(unittest.TestCase):
         self.assertFalse(fetch.notify(0, 5))
 
 
+class ConfigTest(unittest.TestCase):
+    def test_config_path_is_outside_the_cache_dir(self):
+        # uninstall.sh --purge removes the cache dir; settings must survive.
+        self.assertNotIn(fetch.CACHE_DIR, fetch.CONFIG_PATH)
+        self.assertTrue(fetch.CONFIG_PATH.endswith(
+            os.path.join(".config", "fable-meter", "config.json")))
+
+    def test_read_config_missing_and_corrupt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            self.assertEqual(fetch.read_config(path), {})
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("{oops")
+            self.assertEqual(fetch.read_config(path), {})
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("42")
+            self.assertEqual(fetch.read_config(path), {})
+
+    def test_ensure_config_creates_a_0600_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = os.path.join(tmp, "fable-meter")
+            path = os.path.join(directory, "config.json")
+            self.assertTrue(fetch.ensure_config(path))
+            with open(path, "r", encoding="utf-8") as fh:
+                self.assertEqual(json.load(fh), {"lang": "auto"})
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(os.stat(directory).st_mode), 0o700)
+
+    def test_ensure_config_never_overwrites_a_hand_edited_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write('{"lang": "en"}\n')
+            self.assertFalse(fetch.ensure_config(path))
+            self.assertEqual(fetch.read_config(path), {"lang": "en"})
+
+
+class LocaleTest(unittest.TestCase):
+    def test_lang_from_locale(self):
+        self.assertEqual(fetch._lang_from_locale("ja_JP"), "ja")
+        self.assertEqual(fetch._lang_from_locale("ja-JP.UTF-8\n"), "ja")
+        self.assertEqual(fetch._lang_from_locale("en_US"), "en")
+        self.assertEqual(fetch._lang_from_locale("fr_FR"), "en")
+        self.assertIsNone(fetch._lang_from_locale(""))
+        self.assertIsNone(fetch._lang_from_locale(None))
+
+    def _with_defaults_output(self, out, env):
+        class Result(object):
+            stdout = out
+
+        def fake_run(argv, **kwargs):
+            self.assertEqual(argv, ["/usr/bin/defaults", "read", "-g",
+                                    "AppleLocale"])
+            if out is None:
+                raise OSError("boom")
+            return Result()
+
+        original = fetch.subprocess.run
+        fetch.subprocess.run = fake_run
+        try:
+            return fetch.system_locale_lang(env)
+        finally:
+            fetch.subprocess.run = original
+
+    def test_system_locale_comes_from_defaults(self):
+        self.assertEqual(self._with_defaults_output("ja_JP\n", {}), "ja")
+        self.assertEqual(self._with_defaults_output("en_US\n", {}), "en")
+
+    def test_falls_back_to_the_environment(self):
+        self.assertEqual(
+            self._with_defaults_output("", {"LANG": "ja_JP.UTF-8"}), "ja")
+        self.assertEqual(
+            self._with_defaults_output(None, {"LC_ALL": "ja_JP.UTF-8"}), "ja")
+        self.assertEqual(
+            self._with_defaults_output("", {"LANG": "de_DE.UTF-8"}), "en")
+
+    def test_defaults_to_english(self):
+        self.assertEqual(self._with_defaults_output("", {}), "en")
+
+    def test_resolve_lang_precedence(self):
+        self.assertEqual(fetch.resolve_lang({"lang": "en"}, "ja"), "en")
+        self.assertEqual(fetch.resolve_lang({"lang": "ja"}, "en"), "ja")
+        self.assertEqual(fetch.resolve_lang({"lang": "auto"}, "ja"), "ja")
+        self.assertEqual(fetch.resolve_lang({}, "ja"), "ja")
+        self.assertEqual(fetch.resolve_lang({"lang": "fr"}, "ja"), "ja")
+        self.assertEqual(fetch.resolve_lang({"lang": "auto"}, None), "en")
+        self.assertEqual(fetch.resolve_lang(None, None), "en")
+
+    def test_state_carries_the_resolved_locale(self):
+        good = fetch.build_success_state({"fable": {}}, now=NOW,
+                                         locale_lang="ja")
+        self.assertEqual(good["locale_lang"], "ja")
+        self.assertIsNone(fetch.build_success_state({}, now=NOW)["locale_lang"])
+        self.assertIsNone(
+            fetch.build_success_state({}, now=NOW,
+                                      locale_lang="fr")["locale_lang"])
+
+    def test_error_state_keeps_the_previous_locale(self):
+        good = fetch.build_success_state({}, now=NOW, locale_lang="ja")
+        bad = fetch.build_error_state("network_error", previous=good)
+        self.assertEqual(bad["locale_lang"], "ja")
+        fresh = fetch.build_error_state("network_error", previous=good,
+                                        locale_lang="en")
+        self.assertEqual(fresh["locale_lang"], "en")
+        self.assertIsNone(
+            fetch.build_error_state("network_error", None)["locale_lang"])
+
+
+class NotificationLanguageTest(unittest.TestCase):
+    def test_english_notification_text(self):
+        self.assertEqual(fetch.notification_text(1, 83, "en"),
+                         "Fable exceeded 80% (now 83%)")
+        self.assertEqual(fetch.notification_text(2, 96, "en"),
+                         "Fable exceeded 95% (now 96%)")
+
+    def test_japanese_notification_text(self):
+        self.assertEqual(fetch.notification_text(1, 83, "ja"),
+                         "Fable が80%を超えました(現在 83%)")
+
+    def test_unknown_language_falls_back_to_english(self):
+        self.assertEqual(fetch.notification_text(1, 83, "fr"),
+                         "Fable exceeded 80% (now 83%)")
+
+    def test_unknown_band_has_no_text(self):
+        self.assertIsNone(fetch.notification_text(0, 5, "en"))
+
+    def test_notify_uses_the_requested_language(self):
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = argv
+            return None
+
+        original = fetch.subprocess.run
+        fetch.subprocess.run = fake_run
+        try:
+            self.assertTrue(fetch.notify(2, 96, lang="en"))
+        finally:
+            fetch.subprocess.run = original
+        self.assertEqual(
+            seen["argv"][2],
+            'display notification "Fable exceeded 95% (now 96%)" '
+            'with title "fable-meter"')
+
+
 if __name__ == "__main__":
     unittest.main()
