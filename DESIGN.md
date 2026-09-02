@@ -48,6 +48,7 @@ Accept: application/json
 ```
 
 **Fable は `limits[]` の中の `kind == "weekly_scoped"` かつ `scope.model.display_name == "Fable"` の要素。** claude-meter が `null` しか出せないのは、固定キー `seven_day_*` だけを見て `limits[]` を無視しているため。
+名前が将来変わりうる(`Fable 5.1` など)ので、実際の選択は §4 の梯子で行う。
 
 ### 認証情報
 
@@ -126,8 +127,26 @@ claude-usage-tracker/          (GitHub: fable-meter)
    - `limits[]` が無い/配列でない → `schema_error`
    - `five_hour` ← `kind == "session"`、`seven_day` ← `kind == "weekly_all"`。無ければトップレベルの `five_hour` / `seven_day` にフォールバック。
    - `scoped[]` ← `kind == "weekly_scoped"` を全て(`name = scope.model.display_name or scope.surface or "unknown"`)。
-   - `fable` ← `scoped` のうち `name == "Fable"`(大文字小文字無視)。**無ければ `fable_not_found` エラー。0% を捏造しない。**
+   - `fable` ← `scoped` から `select_fable()` の梯子で1つ選ぶ(下記)。**無ければ `fable_not_found` エラー。0% を捏造しない。**
    - `percent` が数値でない要素は `schema_error`。
+
+#### Fable 枠の選択(`select_fable()`)
+
+モデル名は API が返す表示名で、将来 `Fable 5.1` のように**改称されうる**。
+そのたびに動かなくなるのを避けるため、`scoped[]` から次の梯子で1つ選ぶ
+(上から順に、決まった時点で確定):
+
+1. 名前が(大文字小文字を無視して)**ちょうど `fable`** のもの。
+2. 無ければ、名前が **`fable` で始まる**もの(`Fable 5.1` など)。部分一致は取らない
+   (`Claude Fable` は当たらない)。
+3. 前方一致が複数あるときは、`is_active` が真のものが**ちょうど1つ**ならそれ。
+4. それでも決まらなければ `percent` が**最大**のもの。同率は API の並び順で先勝ち。
+
+どれにも当たらなければ `fable_not_found`(従来どおり 0% は捏造しない)。
+選んだ枠の名前は `data.fable.name` に記録する
+(どれを `F` として出しているかを state から追えるようにするため)。
+`is_active` は**選択にだけ**使い、state には載せない(`scoped[]` の形は不変)。
+`scoped[]` には従来どおり `weekly_scoped` を**全部**入れる。
 6. state.json 書き出し。
 7. history.jsonl に1行追記(§4.1)。
 8. 閾値通知の判定と発火(§4.2)。`--dry-run` では 6〜8 をいずれも行わない(副作用なし)。
@@ -142,7 +161,7 @@ claude-usage-tracker/          (GitHub: fable-meter)
   "error": null,
   "error_at": null,
   "data": {
-    "fable":     {"percent": 12, "resets_at": "2026-09-04T14:59:59+00:00", "severity": "normal"},
+    "fable":     {"percent": 12, "resets_at": "2026-09-04T14:59:59+00:00", "severity": "normal", "name": "Fable"},
     "seven_day": {"percent": 9,  "resets_at": "...", "severity": "normal"},
     "five_hour": {"percent": 6,  "resets_at": "...", "severity": "normal"},
     "scoped":    [{"name": "Fable", "percent": 12, "resets_at": "...", "severity": "normal"}],
@@ -269,6 +288,14 @@ macOS 26(Tahoe、実測 26.3 / build 25D125)では、**無効な `NSMenuItem` �
 | `ok == false` かつ鮮度は正常/10分未満 | `F12%! W9%! S6%!`(値は残すが失敗中であることを示す) |
 
 - 色(Fable の % で決める。SwiftBar は背景色を変えられないので文字色で代替): 80% 超 → `color=#e0a800`(黄)、95% 超 → `color=#d0021b`(赤)。それ以外はデフォルト。鮮度異常(`?`/`--`)時はグレー `color=#8e8e93`。
+- ドロップダウンの**枠の行は `data.scoped` から動的に作る**(`limit_rows()`): スコープ枠を
+  API が返した順に1行ずつ、**ラベルは API の名前をそのまま**使う(モデル名は翻訳しない)。
+  その後ろに `週間(全モデル)` と `セッション(5h)` が従来どおり並ぶ。
+  枠が `Fable` ひとつだけの通常ケースでは、従来の固定1行と**出力が完全に一致する**
+  (テストで回帰を固定している)。`scoped` を持たない古い state や壊れた値のときは
+  `data.fable` の1行にフォールバックする(表示が消えない)。
+  メニューバーのタイトルは `F/W/S` のまま: `F` は §4 の梯子で選ばれた枠で、
+  スコープ枠が増えてもタイトルには足さない(1行に収める表示なので)。
 - ドロップダウン(日本語 or 英語。§5.1。ラベルは全角幅を2桁として計算し、等幅 `font=Menlo size=12` で桁を揃える):
   ```
   Fable             12%   リセット 9/4 23:59 (あと5日2時間)
@@ -296,7 +323,10 @@ macOS 26(Tahoe、実測 26.3 / build 25D125)では、**無効な `NSMenuItem` �
   期間は ja が `3日19時間`、en が `3d 19h`。
 - ラベル幅は言語ごと(`LABEL_WIDTHS`): ja は 16 セル(全角ラベルが 14 セル)、
   en は 21 セル(`Weekly (all models)` が 19 セル)。`pad_label()` は東アジア文字幅を数えるので、
-  英語ラベルでも 3 枠と予測行の桁が揃う。
+  英語ラベルでも各枠と予測行の桁が揃う。
+- スコープ枠のラベルは **API 由来なのでラベル幅より長いことがある**。`pad_label()` は
+  `truncate_label()` で幅ぴったりに切り、切ったことを `…` で示す(全角も1文字2セルで数える)。
+  切らないと右側の % とリセットの桁が全部ずれる。既存のラベルはすべて幅より短いので影響しない。
 - 言語の解決(`read_config()` + `resolve_lang()`)は `main()` だけが行い、`render()` 以下は
   `lang` を引数で受ける純関数のまま(テストで両言語を直接指定できる)。
   `config.json` は毎回読む(ローカルの小さな JSON なので 10 秒周期でも十分速い)。
@@ -320,6 +350,11 @@ macOS 26(Tahoe、実測 26.3 / build 25D125)では、**無効な `NSMenuItem` �
 
 `seven_day` は API が `null` を返すことがあるので、その点は**その指標の窓からだけ**外す
 (`metric_entries`)。Fable 側は従来どおり全点を使う。
+
+**制約: 予測はこの2指標だけ**。ドロップダウンの枠の行は `data.scoped` から動的に増えるが
+(§5)、`history.jsonl` は `fable` と `seven_day` の2列しか記録しないので、任意の
+スコープ枠の予測は出せない(過去の点が無いものは捏造になる)。Fable 以外のスコープ枠にも
+予測を出したくなったら、まず履歴スキーマを枠ごとの列に拡張する必要がある。
 
 **窓の判別キーは両指標とも履歴の `fable_resets_at`**。Fable は `...14:59:59.x`、
 seven_day は `...15:00:00.x` を返すが、これは**同じ週次境界**であり、

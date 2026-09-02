@@ -331,6 +331,40 @@ def _entry_from_toplevel(block):
     }
 
 
+def select_fable(scoped, actives=None):
+    """Pick the Fable window out of the scoped limits, or None.
+
+    梯子(上から順に、決まった時点で確定):
+
+    1. 名前が(大文字小文字を無視して)ちょうど ``fable`` のもの。
+    2. それが無ければ、名前が ``fable`` で**始まる**もの(将来の "Fable 5.1" 等)。
+    3. 前方一致が複数あるときは ``is_active`` が真のものが**ちょうど1つ**ならそれ。
+    4. それでも決まらなければ ``percent`` が最大のもの(同率は API の並び順で先勝ち)。
+
+    どれにも当たらなければ None(呼び出し側が ``fable_not_found`` にする)。
+    0% を捏造しない、という規約はここでも同じ。
+    """
+    scoped = list(scoped or [])
+    actives = list(actives or [])
+    actives += [False] * max(0, len(scoped) - len(actives))
+    named = [(item, flag) for item, flag in zip(scoped, actives)
+             if isinstance(item, dict) and isinstance(item.get("name"), str)]
+    for item, _ in named:
+        if item["name"].strip().lower() == "fable":
+            return item
+    prefixed = [(item, flag) for item, flag in named
+                if item["name"].strip().lower().startswith("fable")]
+    if not prefixed:
+        return None
+    if len(prefixed) == 1:
+        return prefixed[0][0]
+    active = [item for item, flag in prefixed if flag]
+    if len(active) == 1:
+        return active[0]
+    # max() は同率のとき最初の要素を返すので、API の並び順が tiebreak になる。
+    return max((item for item, _ in prefixed), key=lambda item: item["percent"])
+
+
 def parse_usage(payload, plan=None):
     """Turn the API payload into the state.json `data` object.
 
@@ -345,6 +379,7 @@ def parse_usage(payload, plan=None):
     five_hour = None
     seven_day = None
     scoped = []
+    actives = []
     for limit in limits:
         if not isinstance(limit, dict):
             raise FetchError("schema_error")
@@ -358,30 +393,31 @@ def parse_usage(payload, plan=None):
             model = scope.get("model") or {}
             name = model.get("display_name") or scope.get("surface") or "unknown"
             entry = _entry_from_limit(limit)
-            entry["name"] = name
             scoped.append({
                 "name": name,
                 "percent": entry["percent"],
                 "resets_at": entry["resets_at"],
                 "severity": entry["severity"],
             })
+            # is_active は選択のためだけに使う値なので state には載せない。
+            actives.append(limit.get("is_active") is True)
 
     if five_hour is None:
         five_hour = _entry_from_toplevel(payload.get("five_hour"))
     if seven_day is None:
         seven_day = _entry_from_toplevel(payload.get("seven_day"))
 
-    fable = None
-    for item in scoped:
-        if isinstance(item.get("name"), str) and item["name"].lower() == "fable":
-            fable = {
-                "percent": item["percent"],
-                "resets_at": item["resets_at"],
-                "severity": item["severity"],
-            }
-            break
-    if fable is None:
+    chosen = select_fable(scoped, actives)
+    if chosen is None:
         raise FetchError("fable_not_found")
+    fable = {
+        "percent": chosen["percent"],
+        "resets_at": chosen["resets_at"],
+        "severity": chosen["severity"],
+        # 選ばれた枠の API 上の名前。将来 "Fable 5.1" のような改称が来たとき、
+        # どれを F として出しているのかを state から追えるようにする。
+        "name": chosen["name"],
+    }
 
     if not isinstance(plan, str):
         plan = payload.get("plan")

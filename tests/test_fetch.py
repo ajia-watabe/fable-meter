@@ -470,3 +470,119 @@ class NotificationLanguageTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def scoped_limit(name, percent, is_active=False,
+                 resets_at="2026-09-04T14:59:59+00:00"):
+    return {"kind": "weekly_scoped", "group": "weekly", "percent": percent,
+            "severity": "normal", "resets_at": resets_at,
+            "scope": {"model": {"id": None, "display_name": name},
+                      "surface": None},
+            "is_active": is_active}
+
+
+class SelectFableTest(unittest.TestCase):
+    """§4 の選択の梯子: 完全一致 > 前方一致 > is_active > percent 最大。"""
+
+    def test_exact_match_wins_over_prefix(self):
+        payload = load_fixture()
+        payload["limits"] = [
+            scoped_limit("Fable 5.1", 90, is_active=True),
+            scoped_limit("Fable", 12),
+        ]
+        data = fetch.parse_usage(payload)
+        self.assertEqual(data["fable"]["name"], "Fable")
+        self.assertEqual(data["fable"]["percent"], 12)
+
+    def test_exact_match_is_case_insensitive(self):
+        payload = load_fixture()
+        payload["limits"] = [scoped_limit("FABLE", 12)]
+        self.assertEqual(fetch.parse_usage(payload)["fable"]["name"], "FABLE")
+
+    def test_single_prefix_match_is_used(self):
+        payload = load_fixture()
+        payload["limits"] = [scoped_limit("Opus", 3), scoped_limit("Fable 5.1", 42)]
+        data = fetch.parse_usage(payload)
+        self.assertEqual(data["fable"]["name"], "Fable 5.1")
+        self.assertEqual(data["fable"]["percent"], 42)
+
+    def test_prefix_match_is_case_insensitive(self):
+        payload = load_fixture()
+        payload["limits"] = [scoped_limit("fable 6", 7)]
+        self.assertEqual(fetch.parse_usage(payload)["fable"]["name"], "fable 6")
+
+    def test_unique_active_beats_higher_percent(self):
+        payload = load_fixture()
+        payload["limits"] = [
+            scoped_limit("Fable 5", 80, is_active=False),
+            scoped_limit("Fable 6", 20, is_active=True),
+        ]
+        data = fetch.parse_usage(payload)
+        self.assertEqual(data["fable"]["name"], "Fable 6")
+
+    def test_highest_percent_when_several_active(self):
+        payload = load_fixture()
+        payload["limits"] = [
+            scoped_limit("Fable 5", 20, is_active=True),
+            scoped_limit("Fable 6", 55, is_active=True),
+        ]
+        self.assertEqual(fetch.parse_usage(payload)["fable"]["name"], "Fable 6")
+
+    def test_highest_percent_when_none_active(self):
+        payload = load_fixture()
+        payload["limits"] = [
+            scoped_limit("Fable 5", 20),
+            scoped_limit("Fable 6", 55),
+        ]
+        self.assertEqual(fetch.parse_usage(payload)["fable"]["name"], "Fable 6")
+
+    def test_percent_tie_keeps_api_order(self):
+        payload = load_fixture()
+        payload["limits"] = [
+            scoped_limit("Fable 5", 30),
+            scoped_limit("Fable 6", 30),
+        ]
+        self.assertEqual(fetch.parse_usage(payload)["fable"]["name"], "Fable 5")
+
+    def test_no_match_raises_fable_not_found(self):
+        payload = load_fixture()
+        payload["limits"] = [scoped_limit("Opus", 3), scoped_limit("Sonnet", 4)]
+        with self.assertRaises(fetch.FetchError) as ctx:
+            fetch.parse_usage(payload)
+        self.assertEqual(ctx.exception.code, "fable_not_found")
+
+    def test_substring_but_not_prefix_does_not_match(self):
+        payload = load_fixture()
+        payload["limits"] = [scoped_limit("Claude Fable", 3)]
+        with self.assertRaises(fetch.FetchError) as ctx:
+            fetch.parse_usage(payload)
+        self.assertEqual(ctx.exception.code, "fable_not_found")
+
+    def test_state_records_the_chosen_name(self):
+        payload = load_fixture()
+        payload["limits"] = [scoped_limit("Fable 5.1", 42, is_active=True)]
+        state = fetch.build_success_state(fetch.parse_usage(payload), now=NOW)
+        self.assertEqual(state["data"]["fable"]["name"], "Fable 5.1")
+
+    def test_exact_match_also_records_its_name(self):
+        state = fetch.build_success_state(fetch.parse_usage(load_fixture()), now=NOW)
+        self.assertEqual(state["data"]["fable"]["name"], "Fable")
+
+    def test_all_scoped_entries_are_kept(self):
+        payload = load_fixture()
+        payload["limits"] = [
+            scoped_limit("Fable", 12),
+            scoped_limit("Opus", 3),
+        ]
+        data = fetch.parse_usage(payload)
+        self.assertEqual([s["name"] for s in data["scoped"]], ["Fable", "Opus"])
+        # is_active は選択にだけ使い、state には載せない。
+        self.assertEqual(sorted(data["scoped"][0]),
+                         ["name", "percent", "resets_at", "severity"])
+
+    def test_select_fable_tolerates_missing_actives(self):
+        scoped = [{"name": "Fable", "percent": 12, "resets_at": None,
+                   "severity": None}]
+        self.assertIs(fetch.select_fable(scoped), scoped[0])
+        self.assertIsNone(fetch.select_fable([]))
+        self.assertIsNone(fetch.select_fable(None))

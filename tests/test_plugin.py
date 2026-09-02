@@ -1088,3 +1088,101 @@ class ForecastRowColourTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ScopedRowsTest(unittest.TestCase):
+    """`data.scoped` を API の順に 1 行ずつ。Fable 1 枠のときは従来と同一。"""
+
+    def test_single_fable_matches_the_legacy_fixed_row(self):
+        # 従来の実装 = scoped を見ずに data.fable を 1 行出す挙動。
+        # scoped を落とした state はそのフォールバックを通るので、
+        # 「scoped が Fable 1 件だけ」の出力と 1 バイトも違ってはいけない。
+        state = make_state()
+        legacy = json.loads(json.dumps(state))
+        del legacy["data"]["scoped"]
+        self.assertEqual(plugin.render(state, NOW, dark=False),
+                         plugin.render(legacy, NOW, dark=False))
+        self.assertEqual(plugin.render(state, NOW, dark=True, lang="en"),
+                         plugin.render(legacy, NOW, dark=True, lang="en"))
+
+    def test_two_scoped_entries_render_two_rows_in_api_order(self):
+        state = make_state()
+        state["data"]["scoped"].append(
+            {"name": "Opus 4.5", "percent": 31,
+             "resets_at": "2026-09-04T14:59:59+00:00", "severity": "normal"})
+        out = plugin.render(state, NOW, dark=False)
+        rows = [line for line in out.split("\n") if plugin.MONO in line]
+        self.assertTrue(rows[0].startswith(plugin.pad_label("Fable")))
+        self.assertTrue(rows[1].startswith(plugin.pad_label("Opus 4.5")))
+        self.assertIn(" 31%", rows[1])
+        # 週間 / セッションはスコープ行の後ろのまま。
+        self.assertTrue(rows[2].startswith(plugin.pad_label("週間(全モデル)")))
+        self.assertTrue(rows[3].startswith(plugin.pad_label("セッション(5h)")))
+
+    def test_extra_scoped_entry_does_not_change_the_title(self):
+        state = make_state()
+        state["data"]["scoped"].append(
+            {"name": "Opus 4.5", "percent": 31,
+             "resets_at": "2026-09-04T14:59:59+00:00", "severity": "normal"})
+        self.assertEqual(plugin.title_line(state, NOW), "F12% W9% S6%")
+
+    def test_scoped_name_is_not_translated(self):
+        state = make_state()
+        state["data"]["scoped"] = [
+            {"name": "Fable 5.1", "percent": 12,
+             "resets_at": "2026-09-04T14:59:59+00:00", "severity": "normal"}]
+        for lang in ("ja", "en"):
+            self.assertIn("Fable 5.1", plugin.render(state, NOW, dark=False,
+                                                     lang=lang))
+
+    def test_no_forecast_row_for_arbitrary_scoped_entries(self):
+        # history.jsonl は fable と seven_day しか記録しないので、予測は 2 本のまま。
+        self.assertEqual([field for field, _ in plugin.PROJECTION_METRICS],
+                         ["fable", "seven_day"])
+
+    def test_broken_scoped_falls_back_to_the_fable_row(self):
+        for broken in ([], "nope", [None, {"name": 5}]):
+            state = make_state()
+            state["data"]["scoped"] = broken
+            rows = plugin.limit_rows(state["data"])
+            self.assertEqual(rows, [("Fable", state["data"]["fable"])])
+
+
+class TruncateLabelTest(unittest.TestCase):
+    def test_short_labels_are_untouched(self):
+        self.assertEqual(plugin.truncate_label("Fable", 16), "Fable")
+        self.assertEqual(plugin.truncate_label("Weekly (all models)", 21),
+                         "Weekly (all models)")
+
+    def test_exact_width_is_untouched(self):
+        self.assertEqual(plugin.truncate_label("a" * 16, 16), "a" * 16)
+
+    def test_long_label_is_cut_with_an_ellipsis(self):
+        cut = plugin.truncate_label("Fable 5.1 Extended Thinking", 16)
+        self.assertEqual(cut, "Fable 5.1 Exten…")
+        self.assertEqual(plugin.display_width(cut), 16)
+
+    def test_full_width_label_never_overflows(self):
+        cut = plugin.truncate_label("あ" * 20, 16)
+        self.assertLessEqual(plugin.display_width(cut), 16)
+        self.assertTrue(cut.endswith("…"))
+
+    def test_pad_label_truncates_long_names(self):
+        padded = plugin.pad_label("Fable 5.1 Extended Thinking", lang="ja")
+        self.assertEqual(plugin.display_width(padded), 16)
+        padded_en = plugin.pad_label("Fable 5.1 Extended Thinking", lang="en")
+        self.assertEqual(plugin.display_width(padded_en), 21)
+
+    def test_long_scoped_name_keeps_the_columns_aligned(self):
+        state = make_state()
+        state["data"]["scoped"] = [
+            {"name": "Fable 5.1 Extended Thinking", "percent": 12,
+             "resets_at": "2026-09-04T14:59:59+00:00", "severity": "normal"}]
+        out = plugin.render(state, NOW, dark=False)
+        rows = [line for line in out.split("\n") if plugin.MONO in line]
+        self.assertTrue(rows[0].startswith("Fable 5.1 Exten… "))
+        # 3 行とも同じ桁で % が始まる = 長い名前でも桁が崩れない。
+        # "%s %3s%%" なので、"%" の手前から 3 文字落とすとラベル + 空白 1 個。
+        starts = [plugin.display_width(row.split("%")[0][:-3])
+                  for row in rows[:3]]
+        self.assertEqual(starts, [starts[0]] * 3)

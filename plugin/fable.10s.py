@@ -284,9 +284,32 @@ def display_width(text):
     return width
 
 
+def truncate_label(text, width):
+    """Cut `text` down to `width` display cells, marking the cut with "…".
+
+    スコープ枠のラベルは API が返すモデル名なので、ラベル幅より長いことがある。
+    そのまま出すと右側の % とリセットの桁が全部ずれるので、幅で切って詰める。
+    """
+    if width <= 0:
+        return ""
+    if display_width(text) <= width:
+        return text
+    kept = ""
+    used = 0
+    budget = width - display_width("…")
+    for ch in text:
+        cell = display_width(ch)
+        if used + cell > budget:
+            break
+        kept += ch
+        used += cell
+    return kept + "…"
+
+
 def pad_label(text, width=None, lang=DEFAULT_LANG):
     if width is None:
         width = LABEL_WIDTHS.get(lang, LABEL_WIDTH)
+    text = truncate_label(text, width)
     return text + " " * max(0, width - display_width(text))
 
 
@@ -672,6 +695,31 @@ def projection_rows(state, now, history=None, lang=DEFAULT_LANG):
     return rows
 
 
+def limit_rows(data, lang=DEFAULT_LANG):
+    """(ラベル, 枠) の並び。`data.scoped` を API の順にそのまま 1 行ずつ出す。
+
+    ラベルは **API が返した名前をそのまま**使う(モデル名は翻訳しない)。
+    枠が Fable ひとつだけの通常ケースでは、従来の固定 1 行と同じ出力になる。
+    `scoped` を持たない古い state(や壊れた値)では従来どおり `data.fable` を
+    1 行だけ出すので、表示が消えることはない。
+    """
+    labels = strings(lang)
+    data = data if isinstance(data, dict) else {}
+    rows = []
+    scoped = data.get("scoped")
+    if isinstance(scoped, list):
+        for item in scoped:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            rows.append((name, item))
+    if rows:
+        return rows
+    return [(labels["label_fable"], data.get("fable"))]
+
+
 def build_title(state, now):
     """Return (title_line, is_degraded)."""
     data = (state or {}).get("data") if isinstance(state, dict) else None
@@ -738,9 +786,10 @@ def render(state, now=None, python_path=None, fetch_path=None, log_path=LOG_PATH
 
     data = (state or {}).get("data") if isinstance(state, dict) else None
     if isinstance(data, dict):
-        rows = ((labels["label_fable"], data.get("fable")),
-                (labels["label_weekly"], data.get("seven_day")),
-                (labels["label_session"], data.get("five_hour")))
+        rows = limit_rows(data, lang) + [
+            (labels["label_weekly"], data.get("seven_day")),
+            (labels["label_session"], data.get("five_hour")),
+        ]
         if dark is None:
             dark = is_dark_appearance()
         primary = ANSI_PRIMARY_DARK if dark else None

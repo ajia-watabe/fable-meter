@@ -286,7 +286,11 @@ Claude Code を起動すれば Claude Code 自身がトークンを更新する�
 ### `fable_not_found`
 
 `limits[]` に `kind == "weekly_scoped"` かつ `scope.model.display_name == "Fable"` が無い。
-API 側の仕様変更か、Fable 枠が現在割り当てられていない。**0% を捏造せずエラーにしている。**
+名前は完全一致だけでなく **`Fable` で始まる名前**(将来の `Fable 5.1` など)も拾うので、
+モデル名が改称されただけなら追随する(複数該当時は `is_active` → `percent` 最大の順に選び、
+選んだ名前を `state.json` の `data.fable.name` に記録する)。
+それでも当たらないのは API 側の仕様変更か、Fable 枠が現在割り当てられていない場合。
+**0% を捏造せずエラーにしている。**
 
 ### `schema_error` / `http_<status>` / `rate_limited` / `network_error` / `auth_error`
 
